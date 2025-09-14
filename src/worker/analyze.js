@@ -51,6 +51,8 @@ if (!rows.length) {
           ${anime}
         )
     `;
+
+    await sql`REFRESH MATERIALIZED VIEW index_content`;
   }
 }
 

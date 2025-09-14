@@ -18,6 +18,7 @@ import login from "./user/login.js";
 import resetKey from "./user/reset-key.js";
 import resetPassword from "./user/reset-password.js";
 import rss from "./rss.js";
+import { contentIndex, contentDetails } from "./content.js";
 
 const app = express();
 
@@ -92,6 +93,8 @@ app.all("/user/create", create);
 app.all("/user/reset-key", resetKey);
 app.all("/user/reset-password", resetPassword);
 app.all("/rss.xml", rss);
+app.all("/content", contentIndex);
+app.all("/content/:id", contentDetails);
 app.all("/", async (req, res) => {
   res.send("ok");
 });
