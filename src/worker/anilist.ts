@@ -13,6 +13,11 @@ const query = await fs.readFile(
   "utf8",
 );
 
+const ANILIST_DISABLED_MESSAGE =
+  "The AniList API has been temporarily disabled due to severe stability issues.";
+
+class AnilistDisabledError extends Error {}
+
 const submitQuery = async (body) => {
   for (let retry = 0; retry < 5; retry++) {
     const res = await fetch("https://graphql.anilist.co/", {
@@ -31,7 +36,11 @@ const submitQuery = async (body) => {
       console.info(`[anilist][info]  Server side HTTP ${res.status} error, retry after 5 seconds`);
       await new Promise((resolve) => setTimeout(resolve, 5000));
     } else {
-      console.error(`[anilist][error] ${await res.json()}`);
+      const data = await res.json();
+      console.error(`[anilist][error] ${JSON.stringify(data)}`);
+      if (data?.errors?.some((e) => e.message === ANILIST_DISABLED_MESSAGE)) {
+        throw new AnilistDisabledError();
+      }
       return null;
     }
   }
@@ -39,12 +48,25 @@ const submitQuery = async (body) => {
 
 for (let i = 0; i < ids.length; i += 50) {
   const chunk = ids.slice(i, i + 50);
-  const list = await submitQuery({ query, variables: { ids: chunk } });
+
+  let list;
+  let disabled = false;
+  try {
+    list = await submitQuery({ query, variables: { ids: chunk } });
+  } catch (error) {
+    if (!(error instanceof AnilistDisabledError)) throw error;
+    console.error(
+      `[anilist][error] AniList API disabled, placeholding ${chunk} for retry in 4 hours`,
+    );
+    disabled = true;
+    list = [];
+  }
 
   for (const anilist_id of chunk) {
     if (list.find((e) => e.id === anilist_id)) continue;
     list.push({
       id: anilist_id,
+      placeholder: disabled,
       type: "ANIME",
       idMal: anilist_id,
       title: {
@@ -103,5 +125,7 @@ for (let i = 0; i < ids.length; i += 50) {
   `;
   await sql`REFRESH MATERIALIZED VIEW CONCURRENTLY anilist_view`;
   await sql`REFRESH MATERIALIZED VIEW CONCURRENTLY anilist_title`;
+
+  if (disabled) break;
 }
 console.info(`[anilist][done]  ${ids}`);

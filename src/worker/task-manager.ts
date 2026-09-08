@@ -99,6 +99,9 @@ export default class TaskManager {
               id
             FROM
               anilist
+            WHERE
+              NOT COALESCE((json ->> 'placeholder')::boolean, FALSE)
+              OR updated > now() - INTERVAL '4 hours'
           )
       `;
       if (rows.length === 0 || this.isAnilistTaskRunning) return;
