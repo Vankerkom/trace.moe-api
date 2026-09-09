@@ -58,6 +58,20 @@ for (let i = 0; i < hashList.length; i++) {
 const milvus = new MilvusClient({ address: MILVUS_ADDR, token: MILVUS_TOKEN });
 
 try {
+  // loading must be idempotent: without this, anything that re-queues a file
+  // (a failed load, a reverted segment) stacks a second copy of its vectors
+  const cleared = await milvus.delete({
+    collection_name: "frame_color_layout",
+    filter: `file_id == ${id}`,
+  });
+  if (cleared?.status?.error_code && cleared.status.error_code !== "Success") {
+    throw new Error(
+      cleared.status.reason ||
+        cleared.status.detail ||
+        `Milvus error: ${cleared.status.error_code}`,
+    );
+  }
+
   const result = await milvus.insert({
     collection_name: "frame_color_layout",
     data: dedupedHashList.map(({ time, vector }) => ({ file_id: id, time, vector })),

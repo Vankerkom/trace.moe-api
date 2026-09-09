@@ -119,7 +119,14 @@ CREATE TABLE IF NOT EXISTS files (
   scene_count integer GENERATED ALWAYS AS (1 + jsonb_array_length(scene_changes)) STORED,
   media_info jsonb,
   scene_changes jsonb,
-  color_layout bytea
+  color_layout bytea,
+  -- synthetic deduplicated segment rows (NULL = ordinary file)
+  segment_type text CHECK (
+    segment_type IS NULL
+    OR segment_type IN ('opening', 'ending', 'branding')
+  ),
+  segment_label text,
+  segment_reference_id integer
 );
 
 CREATE INDEX IF NOT EXISTS files_anilist_id_idx ON files (anilist_id);
@@ -162,6 +169,41 @@ WHERE
   AND media_info IS NOT NULL
   AND scene_changes IS NOT NULL
   AND color_layout IS NOT NULL;
+
+CREATE INDEX IF NOT EXISTS files_segment_idx ON files (anilist_id)
+WHERE
+  segment_type IS NOT NULL;
+
+CREATE TABLE IF NOT EXISTS segment_matches (
+  id serial PRIMARY KEY,
+  segment_file_id integer NOT NULL REFERENCES files (id) ON DELETE CASCADE,
+  file_id integer NOT NULL REFERENCES files (id) ON DELETE CASCADE,
+  start_time real NOT NULL,
+  end_time real NOT NULL,
+  score real,
+  milvus_deleted boolean NOT NULL DEFAULT FALSE,
+  created timestamp NOT NULL DEFAULT NOW()
+);
+
+CREATE UNIQUE INDEX IF NOT EXISTS segment_matches_segment_file_idx ON segment_matches (segment_file_id, file_id);
+
+CREATE INDEX IF NOT EXISTS segment_matches_file_id_idx ON segment_matches (file_id);
+
+CREATE INDEX IF NOT EXISTS segment_matches_prune_pending_idx ON segment_matches (segment_file_id)
+WHERE
+  milvus_deleted = FALSE;
+
+CREATE TABLE IF NOT EXISTS dedup_runs (
+  anilist_id integer PRIMARY KEY,
+  updated timestamp NOT NULL DEFAULT NOW(),
+  loaded_file_count integer NOT NULL,
+  segments_found integer NOT NULL DEFAULT 0,
+  detect_ms integer,
+  extract_ms integer,
+  log jsonb
+);
+
+CREATE INDEX IF NOT EXISTS dedup_runs_updated_idx ON dedup_runs (updated);
 
 CREATE OR REPLACE VIEW files_view AS
 SELECT

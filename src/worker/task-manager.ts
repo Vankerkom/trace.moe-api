@@ -7,6 +7,7 @@ import aniep from "aniep";
 
 import sql from "../../sql.ts";
 import { parseEpisodeRange } from "../lib/parse-episode.ts";
+import { config } from "../lib/segment-config.ts";
 
 const VIDEO_PATH = path.normalize(process.env.VIDEO_PATH);
 const MAX_WORKER = Number(process.env.MAX_WORKER) || 1;
@@ -31,18 +32,18 @@ export default class TaskManager {
           FROM
             files
         `.then((e) => new Set(e.map((e) => e.path))),
-        fs
-          .readdir(VIDEO_PATH, { recursive: true, withFileTypes: true })
-          .then((e) =>
-            e
-              .filter(
-                (e) =>
-                  e.isFile() &&
-                  path.relative(VIDEO_PATH, e.parentPath).match(/^\d+$/) &&
-                  [".webm", ".mkv", ".mp4"].includes(path.extname(e.name)),
-              )
-              .map((e) => path.join(path.relative(VIDEO_PATH, e.parentPath), e.name)),
-          ),
+        fs.readdir(VIDEO_PATH, { recursive: true, withFileTypes: true }).then((e) =>
+          e
+            .filter(
+              (e) =>
+                e.isFile() &&
+                // note: this only accepts files directly under a numeric dir, so
+                // extracted segments (segments/<anilist_id>/) are never picked up
+                path.relative(VIDEO_PATH, e.parentPath).match(/^\d+$/) &&
+                [".webm", ".mkv", ".mp4"].includes(path.extname(e.name)),
+            )
+            .map((e) => path.join(path.relative(VIDEO_PATH, e.parentPath), e.name)),
+        ),
       ]);
 
       const newFileList = fileList.filter((e) => !dbSet.has(e));
@@ -72,6 +73,8 @@ export default class TaskManager {
       this.runSceneChangesTask();
       this.runColorLayoutTask();
       this.runMilvusLoadTask();
+      this.runDedupTask();
+      this.runBumperTask();
     } catch (error) {
       console.error(error);
     } finally {
@@ -275,11 +278,113 @@ export default class TaskManager {
           this.milvusLoadTaskList.delete(id);
           this.publish();
           this.runMilvusLoadTask();
+          this.runDedupTask();
         });
         this.milvusLoadTaskList.set(id, { id, filePath, worker });
         this.publish();
       }
     } catch (error) {
+      console.error(error);
+    }
+  }
+
+  dedupTaskList = new Map<number, any>();
+  dedupTaskListMax = MAX_WORKER;
+
+  async runDedupTask() {
+    if (!config.enabled) return;
+    if (this.dedupTaskList.size >= this.dedupTaskListMax) return;
+    try {
+      // a series is due when it has never been analysed, or when the number of
+      // indexed episodes changed since the last analysis
+      for (const { anilist_id: anilistId } of await sql`
+        SELECT
+          f.anilist_id
+        FROM
+          files f
+          LEFT JOIN dedup_runs d ON d.anilist_id = f.anilist_id
+        WHERE
+          f.loaded = TRUE
+          AND f.segment_type IS NULL
+        GROUP BY
+          f.anilist_id,
+          d.loaded_file_count
+        HAVING
+          count(*) > ${config.minSupport}
+          AND (
+            d.loaded_file_count IS NULL
+            OR d.loaded_file_count <> count(*) ${
+              // a reverted or re-indexed file comes back with the ranges other
+              // segments had pruned from it, so those need pruning again
+              config.milvusReadonly
+                ? sql``
+                : sql`
+                    OR EXISTS (
+                      SELECT
+                        1
+                      FROM
+                        segment_matches m
+                        JOIN files s ON s.id = m.segment_file_id
+                      WHERE
+                        s.anilist_id = f.anilist_id
+                        AND s.loaded = TRUE
+                        AND m.milvus_deleted = FALSE
+                    )
+                  `
+            }
+          )
+        ORDER BY
+          f.anilist_id DESC
+        LIMIT
+          ${this.dedupTaskListMax}
+      `) {
+        if (this.dedupTaskList.has(anilistId)) continue;
+        const worker = new Worker("./src/worker/dedup.ts", {
+          workerData: { anilistId },
+        });
+        worker.on("error", (error) => console.error(error));
+        worker.on("exit", () => {
+          this.dedupTaskList.delete(anilistId);
+          this.publish();
+          this.runDedupTask();
+          // the extracted segment is a new file and needs indexing itself
+          this.runMediaInfoTask();
+          this.runSceneChangesTask();
+          this.runColorLayoutTask();
+          this.runMilvusLoadTask();
+        });
+        this.dedupTaskList.set(anilistId, {
+          id: anilistId,
+          filePath: `anilist ${anilistId}`,
+          worker,
+        });
+        this.publish();
+      }
+    } catch (error) {
+      console.error(error);
+    }
+  }
+
+  isBumperTaskRunning = false;
+
+  async runBumperTask() {
+    if (!config.enabled) return;
+    if (this.isBumperTaskRunning) return;
+    try {
+      this.isBumperTaskRunning = true;
+      const worker = new Worker("./src/worker/bumper.ts");
+      worker.on("error", (error) => console.error(error));
+      worker.on("exit", () => {
+        this.isBumperTaskRunning = false;
+        this.publish();
+        this.runMediaInfoTask();
+        this.runSceneChangesTask();
+        this.runColorLayoutTask();
+        this.runMilvusLoadTask();
+      });
+      this.publish();
+    } catch (error) {
+      this.isBumperTaskRunning = false;
       console.error(error);
     }
   }
@@ -345,6 +450,8 @@ export default class TaskManager {
       sceneChangesTaskList: Array.from(this.sceneChangesTaskList.values()).map((e) => e.filePath),
       colorLayoutTaskList: Array.from(this.colorLayoutTaskList.values()).map((e) => e.filePath),
       milvusLoadTaskList: Array.from(this.milvusLoadTaskList.values()).map((e) => e.filePath),
+      dedupTaskList: Array.from(this.dedupTaskList.values()).map((e) => e.filePath),
+      bumperTaskList: this.isBumperTaskRunning ? [config.bumperPath] : [],
     };
     for (const client of this.sseClients) {
       client.write(`data: ${JSON.stringify(tasks)}\n\n`);

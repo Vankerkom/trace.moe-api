@@ -6,6 +6,7 @@ import rateLimit from "express-rate-limit";
 import multer from "multer";
 
 import anilist from "./anilist.ts";
+import * as debug from "./debug.ts";
 import getMe from "./get-me.ts";
 import getStats from "./get-stats.ts";
 import getStatus from "./get-status.ts";
@@ -108,6 +109,23 @@ app.all("/user/login", userRateLimiter, login);
 app.all("/user/create", userRateLimiter, create);
 app.all("/user/reset-key", userRateLimiter, resetKey);
 app.all("/user/reset-password", userRateLimiter, resetPassword);
+
+// temporary, unauthenticated segment deduplication debugging surface
+if (process.env.DEBUG_ENDPOINTS) {
+  console.warn("DEBUG_ENDPOINTS is set, mounting unauthenticated /debug routes");
+  app.get("/debug/dedup/:anilistId", debug.dedupDryRun);
+  app.all("/debug/dedup/:anilistId/apply", debug.dedupApply);
+  app.get("/debug/segments", debug.listSegments);
+  app.get("/debug/segments/:anilistId", debug.listSegments);
+  app.get("/debug/segments/:segmentFileId/matches", debug.segmentMatches);
+  app.all("/debug/segments/:segmentFileId/prune", debug.segmentPrune);
+  app.all("/debug/segments/:segmentFileId/revert", debug.segmentRevert);
+  app.all("/debug/prune", debug.pruneAll);
+  app.get("/debug/bumpers", debug.listBumpers);
+  app.all("/debug/bumpers/apply", debug.bumperApply);
+  app.get("/debug/milvus/file/:fileId", debug.milvusFile);
+}
+
 app.all("/", async (req, res) => {
   res.send("ok");
 });

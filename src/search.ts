@@ -435,9 +435,13 @@ export default async (req, res) => {
       }
     }
 
-    return list
-      .sort((a, b) => a.score - b.score) // sort in ascending order of difference
-      .slice(0, 10); // return only top 10 results
+    return (
+      list
+        .sort((a, b) => a.score - b.score) // sort in ascending order of difference
+        // a hit on a deduplicated segment expands into one entry per episode it
+        // was extracted from, so keep headroom above the final 10
+        .slice(0, 30)
+    );
   };
 
   const rawResultsList: any[][] = isMultiple
@@ -447,7 +451,8 @@ export default async (req, res) => {
   const allFileIds = Array.from(new Set(rawResultsList.flat().map((e) => e.file_id)));
 
   const filesMap = new Map();
-  if (allFileIds.length > 0) {
+  const loadFiles = async (ids: number[]) => {
+    if (ids.length === 0) return;
     const files = await sql`
       SELECT
         id,
@@ -455,13 +460,99 @@ export default async (req, res) => {
         episode_start,
         episode_end,
         path,
-        duration
+        duration,
+        segment_type
       FROM
         files
       WHERE
-        id IN ${sql(allFileIds)}
+        id IN ${sql(ids)}
     `;
     for (const f of files) filesMap.set(f.id, f);
+  };
+  await loadFiles(allFileIds);
+
+  // segment files hold one canonical copy of an opening/ending/bumper; the
+  // episodes it was pruned from are looked up here and reported individually
+  const matchesBySegment = new Map<number, any[]>();
+  const segmentFileIds = allFileIds.filter((id) => filesMap.get(id)?.segment_type);
+  if (segmentFileIds.length > 0) {
+    const matches = await sql`
+      SELECT
+        segment_file_id,
+        file_id,
+        start_time,
+        end_time
+      FROM
+        segment_matches
+      WHERE
+        segment_file_id IN ${sql(segmentFileIds)}
+      ORDER BY
+        segment_file_id,
+        file_id
+    `;
+    for (const match of matches) {
+      const list = matchesBySegment.get(match.segment_file_id);
+      if (list) list.push(match);
+      else matchesBySegment.set(match.segment_file_id, [match]);
+    }
+    await loadFiles(
+      Array.from(new Set(matches.map((e) => e.file_id))).filter((id) => !filesMap.has(id)),
+    );
+  }
+
+  const anilistIDFilter = req.query.anilistID?.match(/^\d+$/) ? Number(req.query.anilistID) : null;
+
+  const expandSegments = (rawResults: any[]) => {
+    const expanded = [];
+    for (const entry of rawResults) {
+      const matches = matchesBySegment.get(entry.file_id);
+      if (!matches) {
+        expanded.push(entry);
+        continue;
+      }
+      for (const match of matches) {
+        const offset = match.start_time;
+        const clamp = (time: number) =>
+          Math.min(Math.max(time + offset, match.start_time), match.end_time);
+        expanded.push({
+          ...entry,
+          file_id: match.file_id,
+          from: clamp(entry.from),
+          at: clamp(entry.at),
+          to: clamp(entry.to),
+        });
+      }
+    }
+
+    // equally-scored entries come from one segment, so order them by episode
+    expanded.sort(
+      (a, b) =>
+        a.score - b.score ||
+        (filesMap.get(a.file_id)?.episode_start ?? 0) -
+          (filesMap.get(b.file_id)?.episode_start ?? 0) ||
+        a.file_id - b.file_id,
+    );
+
+    const list = [];
+    for (const entry of expanded) {
+      const file = filesMap.get(entry.file_id);
+      if (!file) continue;
+      // a bumper's episodes span several series, so re-apply the scope here
+      if (anilistIDFilter !== null && file.anilist_id !== anilistIDFilter) continue;
+      // an episode can be hit directly and through a segment; keep the better one
+      if (
+        list.some((e) => e.file_id === entry.file_id && e.from <= entry.to && entry.from <= e.to)
+      ) {
+        continue;
+      }
+      list.push(entry);
+      if (list.length >= 10) break;
+    }
+    return list;
+  };
+
+  for (let i = 0; i < rawResultsList.length; i++) {
+    rawResultsList[i] = expandSegments(rawResultsList[i]);
   }
 
   const window = 60 * 60; // snap to nearest hour for better cache
