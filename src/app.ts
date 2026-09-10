@@ -12,6 +12,7 @@ import getStats from "./get-stats.ts";
 import getStatus from "./get-status.ts";
 import image from "./image.ts";
 import search from "./search.ts";
+import segmentsView from "./segments-view.ts";
 import tasks from "./tasks.ts";
 import create from "./user/create.ts";
 import login from "./user/login.ts";
@@ -115,8 +116,10 @@ if (process.env.DEBUG_ENDPOINTS) {
   console.warn("DEBUG_ENDPOINTS is set, mounting unauthenticated /debug routes");
   app.get("/debug/dedup/:anilistId", debug.dedupDryRun);
   app.all("/debug/dedup/:anilistId/apply", debug.dedupApply);
+  app.get("/debug/segments-view", segmentsView);
   app.get("/debug/segments", debug.listSegments);
   app.get("/debug/segments/:anilistId", debug.listSegments);
+  app.get("/debug/segments/:anilistId/episodes", debug.listEpisodes);
   app.get("/debug/segments/:segmentFileId/matches", debug.segmentMatches);
   app.all("/debug/segments/:segmentFileId/prune", debug.segmentPrune);
   app.all("/debug/segments/:segmentFileId/revert", debug.segmentRevert);

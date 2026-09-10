@@ -1,0 +1,490 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <title>segment dedup viewer</title>
+    <style>
+      :root {
+        --color-indexed: #d9a441;
+        --color-pruned: #b3413e;
+        --color-bg: #14161a;
+        --color-panel: #1d2025;
+        --color-border: #33383f;
+        --color-text: #e4e6eb;
+        --color-muted: #8b909a;
+        color-scheme: dark;
+      }
+
+      * {
+        box-sizing: border-box;
+      }
+
+      body {
+        margin: 0;
+        padding: 24px;
+        background: var(--color-bg);
+        color: var(--color-text);
+        font:
+          14px/1.4 -apple-system,
+          "Segoe UI",
+          Roboto,
+          sans-serif;
+      }
+
+      h1 {
+        font-size: 18px;
+        margin: 0 0 16px;
+      }
+
+      .controls {
+        display: flex;
+        align-items: center;
+        gap: 8px;
+        margin-bottom: 16px;
+        flex-wrap: wrap;
+      }
+
+      input[type="number"] {
+        background: var(--color-panel);
+        border: 1px solid var(--color-border);
+        color: var(--color-text);
+        padding: 6px 10px;
+        border-radius: 4px;
+        width: 140px;
+      }
+
+      button {
+        background: var(--color-panel);
+        border: 1px solid var(--color-border);
+        color: var(--color-text);
+        padding: 6px 12px;
+        border-radius: 4px;
+        cursor: pointer;
+      }
+
+      button:hover:not(:disabled) {
+        border-color: var(--color-muted);
+      }
+
+      button:disabled {
+        opacity: 0.5;
+        cursor: default;
+      }
+
+      button.danger:hover:not(:disabled) {
+        border-color: var(--color-pruned);
+      }
+
+      .legend {
+        display: flex;
+        gap: 16px;
+        align-items: center;
+        margin-bottom: 20px;
+        color: var(--color-muted);
+        font-size: 12px;
+      }
+
+      .legend .swatch {
+        display: inline-block;
+        width: 12px;
+        height: 12px;
+        border-radius: 2px;
+        margin-right: 4px;
+        vertical-align: middle;
+      }
+
+      .status {
+        color: var(--color-muted);
+        margin-bottom: 12px;
+        min-height: 18px;
+      }
+
+      section {
+        background: var(--color-panel);
+        border: 1px solid var(--color-border);
+        border-radius: 6px;
+        padding: 16px;
+        margin-bottom: 20px;
+      }
+
+      section h2 {
+        font-size: 14px;
+        margin: 0 0 12px;
+        color: var(--color-muted);
+        text-transform: uppercase;
+        letter-spacing: 0.05em;
+      }
+
+      table {
+        width: 100%;
+        border-collapse: collapse;
+        font-size: 13px;
+      }
+
+      th,
+      td {
+        text-align: left;
+        padding: 6px 8px;
+        border-bottom: 1px solid var(--color-border);
+        white-space: nowrap;
+      }
+
+      th {
+        color: var(--color-muted);
+        font-weight: 500;
+      }
+
+      .badge {
+        display: inline-block;
+        padding: 1px 6px;
+        border-radius: 3px;
+        font-size: 11px;
+        text-transform: uppercase;
+        background: #2a2f37;
+      }
+
+      .badge.opening {
+        color: #7fb9e0;
+      }
+      .badge.ending {
+        color: #b98ae0;
+      }
+      .badge.branding {
+        color: #8ae0a8;
+      }
+
+      .row-actions {
+        display: flex;
+        gap: 6px;
+      }
+
+      .row-actions button {
+        padding: 3px 8px;
+        font-size: 12px;
+      }
+
+      .timeline-row {
+        display: flex;
+        align-items: center;
+        gap: 12px;
+        padding: 6px 0;
+        border-bottom: 1px solid var(--color-border);
+      }
+
+      .timeline-row:last-child {
+        border-bottom: none;
+      }
+
+      .timeline-label {
+        width: 260px;
+        flex: 0 0 auto;
+        overflow: hidden;
+        text-overflow: ellipsis;
+        white-space: nowrap;
+        font-size: 12px;
+        color: var(--color-muted);
+      }
+
+      .timeline-bar {
+        position: relative;
+        flex: 1 1 auto;
+        height: 22px;
+        background: #23262c;
+        border-radius: 3px;
+        overflow: hidden;
+      }
+
+      .timeline-overlay {
+        position: absolute;
+        top: 0;
+        bottom: 0;
+        display: flex;
+        align-items: center;
+        justify-content: center;
+        font-size: 10px;
+        color: #14161a;
+        font-weight: 600;
+        overflow: hidden;
+      }
+
+      .timeline-overlay.indexed {
+        background: var(--color-indexed);
+      }
+
+      .timeline-overlay.pruned {
+        background: var(--color-pruned);
+      }
+
+      .empty {
+        color: var(--color-muted);
+        font-style: italic;
+      }
+    </style>
+  </head>
+  <body>
+    <h1>Segment dedup viewer</h1>
+
+    <div class="controls">
+      <input type="number" id="anilistId" placeholder="AniList ID" />
+      <button id="loadBtn">Load</button>
+      <button id="applyBtn">Re-run dedup</button>
+    </div>
+
+    <div class="legend">
+      <span
+        ><span class="swatch" style="background: var(--color-indexed)"></span>matched, still
+        indexed</span
+      >
+      <span
+        ><span class="swatch" style="background: var(--color-pruned)"></span>pruned from
+        Milvus</span
+      >
+    </div>
+
+    <div class="status" id="status"></div>
+
+    <section>
+      <h2>Segments</h2>
+      <div id="segments"><p class="empty">Load an AniList ID to see segments.</p></div>
+    </section>
+
+    <section>
+      <h2>Episode timeline</h2>
+      <div id="timeline"><p class="empty">Load an AniList ID to see the timeline.</p></div>
+    </section>
+
+    <script>
+      let currentAnilistId = null;
+
+      const statusEl = document.getElementById("status");
+      const segmentsEl = document.getElementById("segments");
+      const timelineEl = document.getElementById("timeline");
+      const anilistInput = document.getElementById("anilistId");
+      const loadBtn = document.getElementById("loadBtn");
+      const applyBtn = document.getElementById("applyBtn");
+
+      const setStatus = (text) => {
+        statusEl.textContent = text ?? "";
+      };
+
+      const escapeHtml = (value) =>
+        String(value ?? "").replace(
+          /[&<>"']/g,
+          (c) => ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;", "'": "&#39;" })[c],
+        );
+
+      const fmtTime = (t) => {
+        if (t === null || t === undefined) return "-";
+        const s = Math.floor(t % 60)
+          .toString()
+          .padStart(2, "0");
+        const m = Math.floor(t / 60);
+        return `${m}:${s}`;
+      };
+
+      const loadedLabel = (loaded) =>
+        loaded === true ? "yes" : loaded === false ? "failed" : "pending";
+
+      async function fetchJson(url, options) {
+        const res = await fetch(url, options);
+        const body = await res.json().catch(() => ({}));
+        if (!res.ok) throw new Error(body.error || `${res.status} ${res.statusText}`);
+        return body;
+      }
+
+      async function postAction(url, confirmMessage) {
+        if (confirmMessage && !confirm(confirmMessage)) return;
+        try {
+          setStatus(`Calling ${url} ...`);
+          await fetchJson(url, { method: "POST" });
+          setStatus(`Done: ${url}`);
+          if (currentAnilistId) await load(currentAnilistId);
+        } catch (error) {
+          setStatus(`Error: ${error.message}`);
+          alert(error.message);
+        }
+      }
+
+      function renderSegments(segments) {
+        if (segments.length === 0) {
+          segmentsEl.innerHTML = '<p class="empty">No segments found for this series.</p>';
+          return;
+        }
+        const rows = segments
+          .map((seg) => {
+            const type = escapeHtml(seg.segmentType ?? seg.segment_type ?? "");
+            const label = escapeHtml(seg.segmentLabel ?? seg.segment_label ?? "");
+            const ref = seg.segmentReferenceId ?? seg.segment_reference_id ?? "-";
+            const loaded = loadedLabel(seg.loaded);
+            const matches = seg.matches ?? 0;
+            const pruned = seg.pruned ?? 0;
+            const pruneDisabled = seg.loaded !== true ? "disabled" : "";
+            return `
+              <tr>
+                <td>${seg.id}</td>
+                <td><span class="badge ${type}">${type}</span></td>
+                <td>${label}</td>
+                <td>${ref}</td>
+                <td>${loaded}</td>
+                <td>${matches}</td>
+                <td>${pruned}</td>
+                <td class="row-actions">
+                  <button data-action="prune" data-id="${seg.id}" ${pruneDisabled}>Prune</button>
+                  <button data-action="revert" data-id="${seg.id}" class="danger">Revert</button>
+                </td>
+              </tr>`;
+          })
+          .join("");
+        segmentsEl.innerHTML = `
+          <table>
+            <thead>
+              <tr>
+                <th>id</th><th>type</th><th>label</th><th>ref episode</th>
+                <th>loaded</th><th>matches</th><th>pruned</th><th>actions</th>
+              </tr>
+            </thead>
+            <tbody>${rows}</tbody>
+          </table>`;
+
+        segmentsEl.querySelectorAll("button[data-action]").forEach((btn) => {
+          btn.addEventListener("click", () => {
+            const id = btn.dataset.id;
+            if (btn.dataset.action === "prune") {
+              postAction(`/debug/segments/${id}/prune`);
+            } else if (btn.dataset.action === "revert") {
+              postAction(
+                `/debug/segments/${id}/revert`,
+                `Revert segment ${id}? This permanently deletes it and cannot be undone.`,
+              );
+            }
+          });
+        });
+      }
+
+      function renderTimeline(episodes, rangesByFile) {
+        if (episodes.length === 0) {
+          timelineEl.innerHTML = '<p class="empty">No episodes indexed for this series yet.</p>';
+          return;
+        }
+        const rows = episodes
+          .map((ep) => {
+            const label =
+              ep.episode_start !== null && ep.episode_start !== undefined
+                ? `E${ep.episode_start}${ep.episode_end && ep.episode_end !== ep.episode_start ? `-${ep.episode_end}` : ""}`
+                : ep.path.split("/").pop();
+            const duration = Number(ep.duration) || 0;
+            const ranges = rangesByFile.get(ep.id) ?? [];
+            const overlays = ranges
+              .map((r) => {
+                if (!duration) return "";
+                const left = Math.max(0, (r.start_time / duration) * 100);
+                const width = Math.max(0.3, ((r.end_time - r.start_time) / duration) * 100);
+                const cls = r.milvus_deleted ? "pruned" : "indexed";
+                const initial = (r.segmentType || "").slice(0, 2).toUpperCase();
+                const title =
+                  `${r.segmentType} "${r.segmentLabel ?? ""}" (segment ${r.segmentFileId}) ` +
+                  `${fmtTime(r.start_time)}-${fmtTime(r.end_time)} score=${r.score ?? "-"} ` +
+                  `${r.milvus_deleted ? "pruned" : "still indexed"}`;
+                return `<div class="timeline-overlay ${cls}" style="left:${left}%;width:${width}%" title="${escapeHtml(title)}">${width > 4 ? initial : ""}</div>`;
+              })
+              .join("");
+            return `
+              <div class="timeline-row">
+                <div class="timeline-label" title="${escapeHtml(ep.path)}">${escapeHtml(label)} (${fmtTime(duration)})</div>
+                <div class="timeline-bar">${overlays}</div>
+              </div>`;
+          })
+          .join("");
+        timelineEl.innerHTML = rows;
+      }
+
+      async function load(anilistId) {
+        currentAnilistId = anilistId;
+        setStatus(`Loading anilist ${anilistId} ...`);
+        segmentsEl.innerHTML = '<p class="empty">Loading...</p>';
+        timelineEl.innerHTML = '<p class="empty">Loading...</p>';
+        try {
+          const [episodesRes, segmentsRes] = await Promise.all([
+            fetchJson(`/debug/segments/${anilistId}/episodes`),
+            fetchJson(`/debug/segments/${anilistId}`),
+          ]);
+
+          const segments = segmentsRes.segments ?? [];
+          const matchesResults = await Promise.all(
+            segments.map((seg) =>
+              fetchJson(`/debug/segments/${seg.id}/matches`).then((r) => ({
+                segment: seg,
+                matches: r.matches ?? [],
+              })),
+            ),
+          );
+
+          const rangesByFile = new Map();
+          for (const { segment, matches } of matchesResults) {
+            for (const m of matches) {
+              const list = rangesByFile.get(m.file_id) ?? [];
+              list.push({
+                ...m,
+                segmentFileId: segment.id,
+                segmentType: segment.segmentType ?? segment.segment_type,
+                segmentLabel: segment.segmentLabel ?? segment.segment_label,
+              });
+              rangesByFile.set(m.file_id, list);
+            }
+          }
+
+          renderSegments(segments);
+          renderTimeline(episodesRes.episodes ?? [], rangesByFile);
+          setStatus(
+            `Loaded anilist ${anilistId}: ${(episodesRes.episodes ?? []).length} episodes, ${segments.length} segments.`,
+          );
+        } catch (error) {
+          setStatus(`Error: ${error.message}`);
+          segmentsEl.innerHTML = `<p class="empty">${escapeHtml(error.message)}</p>`;
+          timelineEl.innerHTML = "";
+        }
+      }
+
+      function loadFromInput() {
+        const id = Number(anilistInput.value);
+        if (!id) {
+          setStatus("Enter a valid AniList ID.");
+          return;
+        }
+        const url = new URL(location.href);
+        url.searchParams.set("anilistId", id);
+        history.replaceState(null, "", url);
+        load(id);
+      }
+
+      loadBtn.addEventListener("click", loadFromInput);
+      anilistInput.addEventListener("keydown", (e) => {
+        if (e.key === "Enter") loadFromInput();
+      });
+      applyBtn.addEventListener("click", async () => {
+        if (!currentAnilistId) {
+          setStatus("Load a series first.");
+          return;
+        }
+        applyBtn.disabled = true;
+        try {
+          setStatus(`Re-running dedup for ${currentAnilistId} ...`);
+          await fetchJson(`/debug/dedup/${currentAnilistId}/apply`, { method: "POST" });
+          setStatus(`Dedup run complete for ${currentAnilistId}.`);
+          await load(currentAnilistId);
+        } catch (error) {
+          setStatus(`Error: ${error.message}`);
+          alert(error.message);
+        } finally {
+          applyBtn.disabled = false;
+        }
+      });
+
+      const initialId = Number(new URLSearchParams(location.search).get("anilistId"));
+      if (initialId) {
+        anilistInput.value = initialId;
+        load(initialId);
+      }
+    </script>
+  </body>
+</html>

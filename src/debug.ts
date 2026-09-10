@@ -158,6 +158,34 @@ export const listSegments = async (req, res) => {
   }
 };
 
+/** GET /debug/segments/:anilistId/episodes - episode timeline base data. */
+export const listEpisodes = async (req, res) => {
+  try {
+    const anilistId = Number(req.params.anilistId);
+    const episodes = await sql`
+      SELECT
+        id,
+        episode_start,
+        episode_end,
+        path,
+        duration,
+        loaded
+      FROM
+        files
+      WHERE
+        anilist_id = ${anilistId}
+        AND segment_type IS NULL
+      ORDER BY
+        episode_start ASC NULLS LAST,
+        id ASC
+    `;
+    res.json({ anilistId, episodes });
+  } catch (error) {
+    console.error(error);
+    res.status(500).json({ error: String(error) });
+  }
+};
+
 /** GET /debug/segments/:segmentFileId/matches - the episodes behind one segment. */
 export const segmentMatches = async (req, res) => {
   try {
