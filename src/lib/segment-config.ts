@@ -73,6 +73,12 @@ export const config = {
   pruneMargin: num(process.env.DEDUP_PRUNE_MARGIN, 0.5),
   // full re-detection only once the episode count grew by this factor
   redetectRatio: num(process.env.DEDUP_REDETECT_RATIO, 1.5),
+  // fraction of a candidate's frames that has to line up with an existing
+  // segment, on one shared time offset, before the two are the same footage
+  duplicateFrameRatio: num(process.env.DEDUP_DUPLICATE_FRAME_RATIO, 0.5),
+  // fraction of the shorter range two matches on the same episode have to
+  // share before they are the same footage
+  duplicateOverlapRatio: num(process.env.DEDUP_DUPLICATE_OVERLAP_RATIO, 0.5),
   // a series can change its opening/ending at a cour boundary, so allow more
   // than one segment of the same type to be found across different episodes
   maxSegmentsPerType: num(process.env.DEDUP_MAX_SEGMENTS_PER_TYPE, 4),

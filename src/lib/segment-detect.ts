@@ -410,6 +410,99 @@ export const matchSegmentToFiles = async (
   return matches;
 };
 
+/** A segment this series already has, as far as duplicate detection cares. */
+export interface ExistingSegment {
+  id: number;
+  segment_type: string;
+  loaded: boolean;
+  // empty while the segment is still being indexed and has no color_layout yet
+  frames: Frame[];
+  matches: { file_id: number; start_time: number; end_time: number }[];
+}
+
+/** Squared L2, the same distance milvus reports for this collection. */
+const squaredDistance = (a: number[], b: number[]) => {
+  let sum = 0;
+  for (let i = 0; i < a.length; i++) sum += (a[i] - b[i]) ** 2;
+  return sum;
+};
+
+/**
+ * Fraction of `probes` that line up with `frames` on one shared time offset -
+ * the same diagonal detection looks for, applied to two frame lists directly.
+ */
+export const alignedFraction = (probes: Frame[], frames: Frame[]) => {
+  if (probes.length === 0 || frames.length === 0) return 0;
+
+  const byBin = new Map<number, Set<number>>();
+  for (let i = 0; i < probes.length; i++) {
+    for (const frame of frames) {
+      if (squaredDistance(probes[i].vector, frame.vector) > config.maxL2) continue;
+      const bin = Math.round((frame.time - probes[i].time) / config.deltaBin);
+      const probeIndices = byBin.get(bin);
+      if (probeIndices) probeIndices.add(i);
+      else byBin.set(bin, new Set([i]));
+    }
+  }
+
+  // neighbouring bins absorb sub-bin drift, exactly as detectForReference does
+  let best = 0;
+  for (const bin of byBin.keys()) {
+    const supported = new Set<number>();
+    for (let b = bin - 2; b <= bin + 2; b++) {
+      for (const probe of byBin.get(b) ?? []) supported.add(probe);
+    }
+    if (supported.size > best) best = supported.size;
+  }
+  return best / probes.length;
+};
+
+/** How much of the shorter of two ranges the two share. */
+const overlapRatio = (
+  a: { start_time: number; end_time: number },
+  b: { start_time: number; end_time: number },
+) => {
+  const overlap = Math.min(a.end_time, b.end_time) - Math.max(a.start_time, b.start_time);
+  if (overlap <= 0) return 0;
+  const shorter = Math.min(a.end_time - a.start_time, b.end_time - b.start_time);
+  return shorter > 0 ? overlap / shorter : 0;
+};
+
+/**
+ * Is this candidate footage the series already has? Detection is re-run every
+ * time the episode count grows, and a growing series hands it a different
+ * subset of episodes each time, so the same opening is otherwise found - and
+ * cut - once per growth spurt. Identity is what matters here, not how many
+ * episodes are new: a real second-cour opening looks nothing like the first
+ * and still gets extracted.
+ */
+export const findDuplicateSegment = (
+  candidate: Candidate,
+  probes: Frame[],
+  existing: ExistingSegment[],
+): ExistingSegment | null => {
+  for (const segment of existing) {
+    // the two land on the same episode at the same time. costs nothing, and it
+    // is the only signal available while the other segment is still indexing
+    for (const match of candidate.matches) {
+      for (const other of segment.matches) {
+        if (other.file_id !== match.file_id) continue;
+        if (overlapRatio(match, other) >= config.duplicateOverlapRatio) return segment;
+      }
+    }
+    // the episodes may no longer overlap at all - the ranges the other segment
+    // explains have been pruned out of milvus by the time this runs - so fall
+    // back to comparing the footage itself
+    if (
+      segment.frames.length > 0 &&
+      alignedFraction(probes, segment.frames) >= config.duplicateFrameRatio
+    ) {
+      return segment;
+    }
+  }
+  return null;
+};
+
 /**
  * Detect the openings/endings shared by the episodes of one anilist_id.
  * `claimed` seeds the mask with footage another pass already explained - the

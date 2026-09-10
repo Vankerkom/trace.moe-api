@@ -7,9 +7,14 @@ import sql from "../../sql.ts";
 import { config } from "../lib/segment-config.ts";
 import {
   detectSeriesSegments,
+  findDuplicateSegment,
   loadBrandingClaims,
+  loadFrames,
   matchSegmentToFiles,
+  sampleFrames,
+  type ExistingSegment,
   type GroupFile,
+  type SegmentMatch,
 } from "../lib/segment-detect.ts";
 import { extractSegment, pruneMatches } from "../lib/segment-extract.ts";
 
@@ -62,21 +67,32 @@ try {
 
   const [previous] = await sql`
     SELECT
-      loaded_file_count
+      loaded_file_count,
+      log
     FROM
       dedup_runs
     WHERE
       anilist_id = ${anilistId}
   `;
+  // a deferred run leaves this marker behind, because it records the current
+  // episode count and would otherwise make `grew` false and lose the full
+  // detection it owed until the series grew by the ratio all over again
+  const owed = previousLog(previous).some((e) => e?.deferred);
 
   // full detection when there is nothing yet, when forced, or once the series
   // grew enough that the previous result is likely no longer the best one
   const grew = previous ? group.length >= previous.loaded_file_count * config.redetectRatio : true;
-  const fullRun = force || segments.length === 0 || grew;
+  const due = force || segments.length === 0 || grew || owed;
+  // a segment that is still being indexed has not pruned its ranges out of
+  // milvus yet, so detection would rediscover its own footage. the incremental
+  // pass is safe meanwhile, and the series comes back here once it has loaded
+  const indexing = segments.filter((e) => !e.loaded);
+  const fullRun = due && indexing.length === 0;
+  if (due && !fullRun) log.push({ deferred: true, indexing: indexing.length });
   console.info(
     `[dedup] anilist ${anilistId} fullRun=${fullRun} (force=${!!force} noSegments=${
       segments.length === 0
-    } grew=${grew})`,
+    } grew=${grew} owed=${owed} indexing=${indexing.length})`,
   );
 
   const startDetect = performance.now();
@@ -98,39 +114,56 @@ try {
       `[dedup][done]  anilist ${anilistId} detected ${candidates.length} candidates in ${detectMs}ms`,
     );
 
-    // a series can legitimately have several openings, so a candidate is only
-    // redundant when the episodes it explains are already linked to a segment
-    // of the same type
-    const covered = new Map<string, Set<number>>();
-    for (const row of await sql`
-      SELECT
-        s.segment_type,
-        m.file_id
-      FROM
-        segment_matches m
-        JOIN files s ON s.id = m.segment_file_id
-      WHERE
-        s.anilist_id = ${anilistId}
-    `) {
-      const set = covered.get(row.segment_type);
-      if (set) set.add(row.file_id);
-      else covered.set(row.segment_type, new Set([row.file_id]));
+    // the same opening must never be cut twice. a series can legitimately have
+    // several openings, so what disqualifies a candidate is being the footage
+    // of a segment that already exists - not how many of its episodes are new
+    const existing: ExistingSegment[] = [];
+    for (const segment of segments) {
+      existing.push({
+        id: segment.id,
+        segment_type: segment.segment_type,
+        loaded: segment.loaded,
+        frames: await loadFrames(segment.id),
+        matches: await sql`
+          SELECT
+            file_id,
+            start_time,
+            end_time
+          FROM
+            segment_matches
+          WHERE
+            segment_file_id = ${segment.id}
+        `,
+      });
     }
     console.info(
-      `[dedup] anilist ${anilistId} already covered: ` +
-        `${[...covered.entries()].map(([type, ids]) => `${type}=${ids.size}`).join(", ") || "none"}`,
+      `[dedup] anilist ${anilistId} comparing against ${existing.length} existing segments`,
     );
 
     const startExtract = performance.now();
     for (const candidate of candidates) {
-      const already = covered.get(candidate.type) ?? new Set();
-      const fresh = candidate.matches.filter((e) => !already.has(e.file_id));
-      if (fresh.length < config.minSupport) {
+      const referenceFrames = await loadFrames(candidate.reference_file_id);
+      const probes = sampleFrames(
+        referenceFrames,
+        candidate.start,
+        candidate.end,
+        config.sampleInterval,
+      );
+      const duplicate = findDuplicateSegment(candidate, probes, existing);
+      if (duplicate) {
         console.info(
-          `[dedup] anilist ${anilistId} ${candidate.type} skipped: already extracted ` +
-            `(fresh=${fresh.length} minSupport=${config.minSupport})`,
+          `[dedup] anilist ${anilistId} ${candidate.type} skipped: same footage as ` +
+            `segment ${duplicate.id} (${duplicate.segment_type})`,
         );
-        log.push({ type: candidate.type, skipped: "already extracted" });
+        log.push({
+          type: candidate.type,
+          skipped: "duplicate",
+          duplicateOf: duplicate.id,
+          ...summary(candidate),
+        });
+        // the episodes it explains still have to be pruned, just against the
+        // segment that already carries this footage
+        await linkToExisting(duplicate, candidate.matches, group);
         continue;
       }
       if (config.milvusReadonly) {
@@ -142,6 +175,14 @@ try {
       }
       const { segmentFileId, relativePath } = await extractSegment(candidate);
       segmentsFound++;
+      // a later candidate of this same run may be this footage again
+      existing.push({
+        id: segmentFileId,
+        segment_type: candidate.type,
+        loaded: false,
+        frames: referenceFrames.filter((e) => e.time >= candidate.start && e.time <= candidate.end),
+        matches: candidate.matches,
+      });
       log.push({ type: candidate.type, segmentFileId, relativePath, ...summary(candidate) });
       console.info(
         `[dedup] anilist ${anilistId} ${candidate.type} ${candidate.duration.toFixed(1)}s ` +
@@ -265,6 +306,61 @@ try {
       loaded_file_count = excluded.loaded_file_count,
       log = excluded.log
   `.catch((e) => console.error(e));
+}
+
+/**
+ * Point the episodes a duplicate candidate explained at the segment that
+ * already carries that footage, so they are still pruned. Only possible once
+ * that segment is queryable; until then the incremental pass picks them up.
+ */
+async function linkToExisting(
+  segment: ExistingSegment,
+  matches: SegmentMatch[],
+  group: GroupFile[],
+) {
+  const linked = new Set(segment.matches.map((e) => e.file_id));
+  const targets = group.filter((e) => matches.some((m) => m.file_id === e.id) && !linked.has(e.id));
+  if (targets.length === 0) return;
+  if (!segment.loaded) {
+    console.info(
+      `[dedup] segment ${segment.id} not loaded yet, leaving ${targets.length} ` +
+        `episodes for the next incremental run`,
+    );
+    return;
+  }
+
+  // realigned against the segment itself, which is more precise than the
+  // candidate's own probe-spaced ranges and can never claim more than it covers
+  const aligned = await matchSegmentToFiles(milvus, segment.id, targets);
+  if (aligned.length === 0) return;
+  await sql`
+    INSERT INTO
+      segment_matches ${sql(
+        aligned.map((e) => ({
+          segment_file_id: segment.id,
+          file_id: e.file_id,
+          start_time: e.start_time,
+          end_time: e.end_time,
+          score: e.score,
+        })),
+      )}
+    ON CONFLICT (segment_file_id, file_id) DO NOTHING
+  `;
+  segment.matches.push(...aligned);
+  console.info(
+    `[dedup] segment ${segment.id} adopted ${aligned.length} episodes from a duplicate candidate`,
+  );
+}
+
+/** The previous run's log, which is stored as a json-encoded string. */
+function previousLog(previous: any): any[] {
+  if (!previous?.log) return [];
+  try {
+    const parsed = typeof previous.log === "string" ? JSON.parse(previous.log) : previous.log;
+    return Array.isArray(parsed) ? parsed : [];
+  } catch {
+    return [];
+  }
 }
 
 function summary(candidate: any) {
