@@ -126,6 +126,7 @@ if (process.env.DEBUG_ENDPOINTS) {
   app.all("/debug/prune", debug.pruneAll);
   app.get("/debug/bumpers", debug.listBumpers);
   app.all("/debug/bumpers/apply", debug.bumperApply);
+  app.get("/debug/milvus/series/:anilistId", debug.milvusSeries);
   app.get("/debug/milvus/file/:fileId", debug.milvusFile);
 }
 

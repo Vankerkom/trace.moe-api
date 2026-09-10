@@ -120,7 +120,7 @@ const addClaimed = (claimed: ClaimedRanges, candidate: Candidate) => {
 };
 
 /** Merge sorted timestamps into runs, tolerating gaps up to `gapTolerance`. */
-const mergeRuns = (times: number[], gapTolerance: number) => {
+export const mergeRuns = (times: number[], gapTolerance: number) => {
   const runs: { start: number; end: number; count: number }[] = [];
   for (const time of times) {
     const last = runs[runs.length - 1];

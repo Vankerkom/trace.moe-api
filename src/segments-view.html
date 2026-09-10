@@ -7,6 +7,8 @@
       :root {
         --color-indexed: #d9a441;
         --color-pruned: #b3413e;
+        --color-milvus: #4f9ad6;
+        --color-expected: #6f7683;
         --color-bg: #14161a;
         --color-panel: #1d2025;
         --color-border: #33383f;
@@ -215,6 +217,53 @@
         background: var(--color-pruned);
       }
 
+      .timeline-bar.dual {
+        height: 30px;
+      }
+
+      /* two stacked half-height lanes: what Milvus holds over what it should */
+      .timeline-overlay.lane-top {
+        bottom: 50%;
+      }
+
+      .timeline-overlay.lane-bottom {
+        top: 50%;
+      }
+
+      .timeline-overlay.milvus {
+        background: var(--color-milvus);
+      }
+
+      .timeline-overlay.expected {
+        background: var(--color-expected);
+      }
+
+      .timeline-overlay.missing {
+        background: var(--color-pruned);
+      }
+
+      .timeline-meta {
+        width: 300px;
+        flex: 0 0 auto;
+        font-size: 11px;
+        color: var(--color-muted);
+        font-variant-numeric: tabular-nums;
+        display: flex;
+        align-items: center;
+        gap: 6px;
+      }
+
+      .timeline-meta button {
+        padding: 2px 6px;
+        font-size: 11px;
+      }
+
+      .section-note {
+        color: var(--color-muted);
+        font-size: 12px;
+        margin: -4px 0 12px;
+      }
+
       .empty {
         color: var(--color-muted);
         font-style: italic;
@@ -228,6 +277,7 @@
       <input type="number" id="anilistId" placeholder="AniList ID" />
       <button id="loadBtn">Load</button>
       <button id="applyBtn">Re-run dedup</button>
+      <label><input type="checkbox" id="expectedChk" /> expected lane (slow)</label>
     </div>
 
     <div class="legend">
@@ -238,6 +288,11 @@
       <span
         ><span class="swatch" style="background: var(--color-pruned)"></span>pruned from
         Milvus</span
+      >
+      <span><span class="swatch" style="background: var(--color-milvus)"></span>in Milvus now</span>
+      <span
+        ><span class="swatch" style="background: var(--color-expected)"></span>expected after the
+        near-duplicate filter</span
       >
     </div>
 
@@ -253,15 +308,30 @@
       <div id="timeline"><p class="empty">Load an AniList ID to see the timeline.</p></div>
     </section>
 
+    <section>
+      <h2>Milvus contents</h2>
+      <p class="section-note" id="milvusNote">
+        What the index actually holds per file, read straight from Milvus. Shading is how many of
+        the available frames survived the near-duplicate filter, so a faint stretch is a static
+        scene thinned to about one frame every 2s and an empty stretch was pruned — the filter never
+        leaves a gap, only a thinner bar. Segment files have no rows above, because segment_matches
+        times are coordinates in the source episode.
+      </p>
+      <div id="milvus"><p class="empty">Load an AniList ID to see the index.</p></div>
+    </section>
+
     <script>
       let currentAnilistId = null;
+      let currentMilvus = { files: [] };
 
       const statusEl = document.getElementById("status");
       const segmentsEl = document.getElementById("segments");
       const timelineEl = document.getElementById("timeline");
+      const milvusEl = document.getElementById("milvus");
       const anilistInput = document.getElementById("anilistId");
       const loadBtn = document.getElementById("loadBtn");
       const applyBtn = document.getElementById("applyBtn");
+      const expectedChk = document.getElementById("expectedChk");
 
       const setStatus = (text) => {
         statusEl.textContent = text ?? "";
@@ -280,6 +350,12 @@
           .padStart(2, "0");
         const m = Math.floor(t / 60);
         return `${m}:${s}`;
+      };
+
+      // a block length, where seconds matter more than a wall-clock position
+      const fmtSeconds = (seconds) => {
+        const value = Number(seconds) || 0;
+        return value < 60 ? `${value.toFixed(1)}s` : `${fmtTime(value)} (${Math.round(value)}s)`;
       };
 
       const loadedLabel = (loaded) =>
@@ -381,11 +457,17 @@
                 const width = Math.max(0.3, ((r.end_time - r.start_time) / duration) * 100);
                 const cls = r.milvus_deleted ? "pruned" : "indexed";
                 const initial = (r.segmentType || "").slice(0, 2).toUpperCase();
+                const length = r.end_time - r.start_time;
+                // how long the block runs, which is the thing you compare
+                // across episodes when a detected boundary looks wrong
+                const caption =
+                  width > 5 ? `${initial} ${Math.round(length)}s` : width > 2.5 ? initial : "";
                 const title =
                   `${r.segmentType} "${r.segmentLabel ?? ""}" (segment ${r.segmentFileId}) ` +
-                  `${fmtTime(r.start_time)}-${fmtTime(r.end_time)} score=${r.score ?? "-"} ` +
+                  `${fmtTime(r.start_time)}-${fmtTime(r.end_time)} ` +
+                  `length ${fmtSeconds(length)} score=${r.score ?? "-"} ` +
                   `${r.milvus_deleted ? "pruned" : "still indexed"}`;
-                return `<div class="timeline-overlay ${cls}" style="left:${left}%;width:${width}%" title="${escapeHtml(title)}">${width > 4 ? initial : ""}</div>`;
+                return `<div class="timeline-overlay ${cls}" style="left:${left}%;width:${width}%" title="${escapeHtml(title)}">${escapeHtml(caption)}</div>`;
               })
               .join("");
             return `
@@ -398,15 +480,155 @@
         timelineEl.innerHTML = rows;
       }
 
+      // one row per file: indexed blocks over expected blocks, with the holes
+      // between them marked, all normalized to that file's own duration so a
+      // row lines up with the same episode in the section above
+      function renderMilvus(payload) {
+        const files = payload.files ?? [];
+        if (files.length === 0) {
+          milvusEl.innerHTML = '<p class="empty">No files for this series.</p>';
+          return;
+        }
+        milvusEl.innerHTML = files.map((file) => milvusRow(file, payload)).join("");
+        milvusEl.querySelectorAll("button[data-expected]").forEach((btn) => {
+          btn.addEventListener("click", () => loadExpectedFor(Number(btn.dataset.expected)));
+        });
+      }
+
+      function milvusRow(file, payload) {
+        const type = file.segment_type;
+        const label = type
+          ? `<span class="badge ${escapeHtml(type)}">${escapeHtml(type)}</span> #${file.id}`
+          : file.episode_start !== null && file.episode_start !== undefined
+            ? `E${file.episode_start}${file.episode_end && file.episode_end !== file.episode_start ? `-${file.episode_end}` : ""}`
+            : escapeHtml(file.path.split(/[/\\]/).pop());
+
+        const axis = Number(file.axis) || 0;
+        // duration is generated from media_info and is null until that stage runs
+        const axisNote = Number(file.duration) ? "" : ` (axis ${fmtTime(axis)}, no duration)`;
+        const bucketSeconds = axis / payload.buckets;
+
+        const blockBar = (blocks, cls, laneCls, describe) =>
+          (blocks ?? [])
+            .map((block) => {
+              const start = block.start ?? block[0];
+              const end = block.end ?? block[1];
+              const left = Math.max(0, (start / axis) * 100);
+              const width = Math.max(0.3, ((end - start) / axis) * 100);
+              return `<div class="timeline-overlay ${cls} ${laneCls}" style="left:${left}%;width:${width}%" title="${escapeHtml(describe(block, start, end))}"></div>`;
+            })
+            .join("");
+
+        /**
+         * A solid bar cannot show what the near-duplicate filter did: it thins
+         * a static scene to ~1 frame every 2s rather than removing it, so the
+         * blocks stay continuous. Shade each bucket by how many of the frames
+         * that were available actually survived instead.
+         */
+        const densityBar = (density, cls, laneCls, kind) => {
+          if (!density || !axis) return "";
+          const norm = file.density.raw ?? null;
+          const peak = Math.max(1, ...density);
+          const width = 100 / density.length;
+          return density
+            .map((count, i) => {
+              if (!count) return "";
+              const available = norm ? norm[i] : 0;
+              const ratio = available ? Math.min(1, count / available) : count / peak;
+              // gamma, so a heavily thinned bucket stays visible
+              const opacity = (0.18 + 0.82 * Math.pow(ratio, 0.55)).toFixed(3);
+              const from = fmtTime(i * bucketSeconds);
+              const to = fmtTime((i + 1) * bucketSeconds);
+              const title = available
+                ? `${kind} ${from}-${to}: ${count} of ${available} frames kept (${Math.round(ratio * 100)}%)`
+                : `${kind} ${from}-${to}: ${count} frames`;
+              return `<div class="timeline-overlay ${cls} ${laneCls}" style="left:${(i * width).toFixed(3)}%;width:${width.toFixed(3)}%;opacity:${opacity}" title="${escapeHtml(title)}"></div>`;
+            })
+            .join("");
+        };
+
+        const dual = file.expected ? " dual" : "";
+        const indexedLane = densityBar(
+          file.density.indexed,
+          "milvus",
+          file.expected ? "lane-top" : "",
+          "in Milvus",
+        );
+        const expectedLane = file.expected
+          ? densityBar(file.density.expected, "expected", "lane-bottom", "expected")
+          : "";
+        const missingLane = file.missing
+          ? blockBar(
+              file.missing,
+              "missing",
+              file.expected ? "lane-top" : "",
+              (block, start, end) =>
+                `missing ${fmtTime(start)}-${fmtTime(end)}, length ${fmtSeconds(end - start)} — ` +
+                `a pruned range, inset by ${payload.pruneMargin}s at each end`,
+            )
+          : "";
+
+        const parts = [
+          file.expected
+            ? `${file.indexed.count} / ${file.expected.count} vec (Δ${file.delta})`
+            : `${file.indexed.count} vec`,
+        ];
+        if (file.rawCount)
+          parts.push(`kept ${Math.round((file.expected.count / file.rawCount) * 100)}% of frames`);
+        parts.push(`gap ${fmtSeconds(file.indexed.largestGap)}`);
+        parts.push(`blocks ${file.indexed.blocks.length}`);
+        parts.push(`loaded ${loadedLabel(file.loaded)}`);
+        const expandBtn = file.expected
+          ? ""
+          : `<button data-expected="${file.id}" title="decompress color_layout and run the near-duplicate filter for this file">expected</button>`;
+
+        return `
+              <div class="timeline-row">
+                <div class="timeline-label" title="${escapeHtml(file.path)}">${label} (${fmtTime(axis)})${axisNote}</div>
+                <div class="timeline-bar${dual}">${expectedLane}${indexedLane}${missingLane}</div>
+                <div class="timeline-meta"><span>${escapeHtml(parts.join(" · "))}</span>${expandBtn}</div>
+              </div>`;
+      }
+
+      function milvusUrl(anilistId, extra) {
+        const params = new URLSearchParams();
+        if (expectedChk.checked) params.set("expected", "1");
+        for (const [key, value] of Object.entries(extra ?? {})) params.set(key, value);
+        const query = params.toString();
+        return `/debug/milvus/series/${anilistId}${query ? `?${query}` : ""}`;
+      }
+
+      // the expensive lane for a single row, so a page load never pays for it
+      async function loadExpectedFor(fileId) {
+        if (!currentAnilistId) return;
+        try {
+          setStatus(`Computing expected frames for file ${fileId} ...`);
+          const patch = await fetchJson(
+            milvusUrl(currentAnilistId, { expected: "1", files: String(fileId) }),
+          );
+          const updated = patch.files?.[0];
+          if (!updated) return;
+          const index = currentMilvus.files.findIndex((e) => e.id === fileId);
+          if (index !== -1) currentMilvus.files[index] = updated;
+          currentMilvus.pruneMargin = patch.pruneMargin;
+          renderMilvus(currentMilvus);
+          setStatus(`Expected frames for file ${fileId}: ${updated.expected?.count ?? "-"}.`);
+        } catch (error) {
+          setStatus(`Error: ${error.message}`);
+        }
+      }
+
       async function load(anilistId) {
         currentAnilistId = anilistId;
         setStatus(`Loading anilist ${anilistId} ...`);
         segmentsEl.innerHTML = '<p class="empty">Loading...</p>';
         timelineEl.innerHTML = '<p class="empty">Loading...</p>';
+        milvusEl.innerHTML = '<p class="empty">Loading...</p>';
         try {
-          const [episodesRes, segmentsRes] = await Promise.all([
+          const [episodesRes, segmentsRes, milvusRes] = await Promise.all([
             fetchJson(`/debug/segments/${anilistId}/episodes`),
             fetchJson(`/debug/segments/${anilistId}`),
+            fetchJson(milvusUrl(anilistId)),
           ]);
 
           const segments = segmentsRes.segments ?? [];
@@ -433,15 +655,20 @@
             }
           }
 
+          currentMilvus = milvusRes;
           renderSegments(segments);
           renderTimeline(episodesRes.episodes ?? [], rangesByFile);
+          renderMilvus(milvusRes);
           setStatus(
-            `Loaded anilist ${anilistId}: ${(episodesRes.episodes ?? []).length} episodes, ${segments.length} segments.`,
+            `Loaded anilist ${anilistId}: ${(episodesRes.episodes ?? []).length} episodes, ` +
+              `${segments.length} segments, ${milvusRes.totals.indexedVectors} vectors across ` +
+              `${milvusRes.totals.files} files in ${milvusRes.ms}ms.`,
           );
         } catch (error) {
           setStatus(`Error: ${error.message}`);
           segmentsEl.innerHTML = `<p class="empty">${escapeHtml(error.message)}</p>`;
           timelineEl.innerHTML = "";
+          milvusEl.innerHTML = "";
         }
       }
 
@@ -451,10 +678,16 @@
           setStatus("Enter a valid AniList ID.");
           return;
         }
-        const url = new URL(location.href);
-        url.searchParams.set("anilistId", id);
-        history.replaceState(null, "", url);
+        syncUrl(id);
         load(id);
+      }
+
+      function syncUrl(anilistId) {
+        const url = new URL(location.href);
+        url.searchParams.set("anilistId", anilistId);
+        if (expectedChk.checked) url.searchParams.set("expected", "1");
+        else url.searchParams.delete("expected");
+        history.replaceState(null, "", url);
       }
 
       loadBtn.addEventListener("click", loadFromInput);
@@ -480,7 +713,15 @@
         }
       });
 
-      const initialId = Number(new URLSearchParams(location.search).get("anilistId"));
+      expectedChk.addEventListener("change", () => {
+        if (!currentAnilistId) return;
+        syncUrl(currentAnilistId);
+        load(currentAnilistId);
+      });
+
+      const initialParams = new URLSearchParams(location.search);
+      const initialId = Number(initialParams.get("anilistId"));
+      expectedChk.checked = initialParams.get("expected") === "1";
       if (initialId) {
         anilistInput.value = initialId;
         load(initialId);

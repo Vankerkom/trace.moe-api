@@ -5,42 +5,13 @@ import { MilvusClient } from "@zilliz/milvus2-sdk-node";
 
 import "../env.ts";
 import sql from "../sql.ts";
+import { dedupeHashList } from "../src/lib/dedupe-hash-list.ts";
 
 const zstdDecompress = promisify(zlib.zstdDecompress);
 
 const { MILVUS_ADDR, MILVUS_TOKEN } = process.env;
 
 const BATCH_SIZE = Number.parseInt(process.argv[2] || "500", 10);
-
-function deduplicate(hashList: any[]) {
-  const sorted = hashList.sort((a: any, b: any) => a.time - b.time);
-  const dedupedHashList: any[] = [];
-
-  for (let i = 0; i < sorted.length; i++) {
-    const currentFrame = sorted[i];
-    let isDuplicate = false;
-
-    const startIndex = Math.max(0, dedupedHashList.length - 50);
-    for (let j = dedupedHashList.length - 1; j >= startIndex; j--) {
-      const frame = dedupedHashList[j];
-      if (currentFrame.time - frame.time < 2) {
-        let exactMatch = true;
-        for (let k = 0; k < frame.vector.length; k++) {
-          if (frame.vector[k] !== currentFrame.vector[k]) {
-            exactMatch = false;
-            break;
-          }
-        }
-        if (exactMatch) {
-          isDuplicate = true;
-          break;
-        }
-      }
-    }
-    if (!isDuplicate) dedupedHashList.push(currentFrame);
-  }
-  return dedupedHashList;
-}
 
 const milvus = new MilvusClient({ address: MILVUS_ADDR, token: MILVUS_TOKEN });
 
@@ -84,7 +55,7 @@ try {
       try {
         const decompressed = await zstdDecompress(row.color_layout);
         const hashList = JSON.parse(decompressed.toString());
-        const deduped = deduplicate(hashList);
+        const deduped = dedupeHashList(hashList);
 
         for (const frame of deduped) {
           batchData.push({

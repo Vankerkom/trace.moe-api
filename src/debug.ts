@@ -1,13 +1,25 @@
 // Temporary local debugging surface for the segment deduplication flow.
 // Unauthenticated, so it is only mounted when DEBUG_ENDPOINTS is set.
 import { performance } from "node:perf_hooks";
+import { promisify } from "node:util";
 import { Worker } from "node:worker_threads";
+import zlib from "node:zlib";
 
 import sql from "../sql.ts";
 import { cachedBumpers, loadBumperPool, matchBumper } from "./lib/bumper-pool.ts";
+import { dedupeHashList } from "./lib/dedupe-hash-list.ts";
+import {
+  bucketDensity,
+  collapseBlocks,
+  defaultGapThreshold,
+  fetchFileTimes,
+  subtractBlocks,
+} from "./lib/milvus-times.ts";
 import { config, SEGMENT_TYPES } from "./lib/segment-config.ts";
 import { detectSeriesSegments, type GroupFile } from "./lib/segment-detect.ts";
 import { pruneMatches, revertSegment } from "./lib/segment-extract.ts";
+
+const zstdDecompress = promisify(zlib.zstdDecompress);
 
 const runWorker = (file: string, workerData: any) =>
   new Promise<number>((resolve) => {
@@ -306,18 +318,8 @@ export const bumperApply = async (req, res) => {
 export const milvusFile = async (req, res) => {
   try {
     const fileId = Number(req.params.fileId);
-    const counted = await req.app.locals.milvus.query({
-      collection_name: "frame_color_layout",
-      filter: `file_id == ${fileId}`,
-      output_fields: ["count(*)"],
-    });
-    const sample = await req.app.locals.milvus.query({
-      collection_name: "frame_color_layout",
-      filter: `file_id == ${fileId}`,
-      output_fields: ["time"],
-      limit: 16384,
-    });
-    const times = (sample.data ?? []).map((e: any) => e.time).sort((a, b) => a - b);
+    const gap = Number(req.query.gap) || defaultGapThreshold;
+    const indexed = collapseBlocks(await fetchFileTimes(req.app.locals.milvus, fileId), gap);
     const [row] = await sql`
       SELECT
         path,
@@ -333,15 +335,154 @@ export const milvusFile = async (req, res) => {
     res.json({
       fileId,
       file: row ?? null,
-      milvusCount: Number(counted.data?.[0]?.["count(*)"] ?? 0),
-      sampled: times.length,
-      minTime: times[0] ?? null,
-      maxTime: times[times.length - 1] ?? null,
+      milvusCount: indexed.count,
+      sampled: indexed.count,
+      minTime: indexed.minTime,
+      maxTime: indexed.maxTime,
       // the largest hole in the indexed timeline, i.e. where a segment was pruned
-      largestGap: times.reduce(
-        (max, time, i) => (i === 0 ? max : Math.max(max, time - times[i - 1])),
-        0,
-      ),
+      largestGap: indexed.largestGap,
+      blocks: indexed.blocks,
+    });
+  } catch (error) {
+    console.error(error);
+    res.status(500).json({ error: String(error) });
+  }
+};
+
+/**
+ * GET /debug/milvus/series/:anilistId - what Milvus actually holds for every
+ * file of a series, episodes and extracted segments alike, as the contiguous
+ * ranges it covers.
+ *
+ * ?expected=1 also decompresses files.color_layout and runs the same
+ * near-duplicate filter milvus-load applies, which is the only way to tell a
+ * hole left by a prune apart from one that was never indexed. That costs a
+ * decompress plus a JSON.parse of every decoded frame per file, so it is
+ * opt-in, done one file at a time, and can be narrowed with ?files=<id,id>.
+ */
+export const milvusSeries = async (req, res) => {
+  try {
+    const startTime = performance.now();
+    const anilistId = Number(req.params.anilistId);
+    const gapThreshold = Number(req.query.gap) || defaultGapThreshold;
+    // one density bucket per few pixels of the rendered bar
+    const buckets = Math.min(1000, Math.max(20, Number(req.query.buckets) || 150));
+    const onlyFiles = req.query.files
+      ? new Set(
+          String(req.query.files)
+            .split(",")
+            .map((e) => Number(e)),
+        )
+      : null;
+    const wantExpected = "expected" in req.query || onlyFiles !== null;
+
+    const rows = await sql`
+      SELECT
+        id,
+        anilist_id,
+        path,
+        episode_start,
+        episode_end,
+        duration,
+        frame_count,
+        loaded,
+        segment_type,
+        segment_label,
+        segment_reference_id
+      FROM
+        files
+      WHERE
+        anilist_id = ${anilistId} ${onlyFiles === null
+          ? sql``
+          : sql`AND id IN ${sql([...onlyFiles])}`}
+      ORDER BY
+        segment_type NULLS FIRST,
+        episode_start ASC NULLS LAST,
+        id ASC
+    `;
+
+    const files = [];
+    let indexedVectors = 0;
+    let expectedVectors = 0;
+    let missingSeconds = 0;
+
+    // sequential on purpose: one decompressed color_layout is tens of MB and
+    // the server runs with --max-old-space-size=512
+    for (const row of rows) {
+      const times = await fetchFileTimes(req.app.locals.milvus, row.id);
+      const indexed = collapseBlocks(times, gapThreshold);
+      indexedVectors += indexed.count;
+      // density needs a time axis, and duration is null until media-info runs
+      const axis = Number(row.duration) || indexed.maxTime || 0;
+      const indexedDensity = bucketDensity(times, axis, buckets);
+
+      let expected = null;
+      let missing = null;
+      let expectedDensity = null;
+      let rawDensity = null;
+      let rawCount = null;
+      if (wantExpected) {
+        const [blob] = await sql`
+          SELECT
+            color_layout
+          FROM
+            files
+          WHERE
+            id = ${row.id}
+        `;
+        if (blob?.color_layout) {
+          const raw = JSON.parse((await zstdDecompress(blob.color_layout)).toString());
+          rawCount = raw.length;
+          rawDensity = bucketDensity(
+            raw.map((e: any) => e.time),
+            axis,
+            buckets,
+          );
+          const hashList = dedupeHashList(raw);
+          const keptTimes = hashList.map((e: any) => e.time);
+          expected = collapseBlocks(keptTimes, gapThreshold);
+          expectedDensity = bucketDensity(keptTimes, axis, buckets);
+          missing = subtractBlocks(expected.blocks, indexed.blocks);
+          expectedVectors += expected.count;
+          missingSeconds += missing.reduce((sum, range) => sum + (range.end - range.start), 0);
+        }
+      }
+
+      files.push({
+        id: row.id,
+        path: row.path,
+        episode_start: row.episode_start,
+        episode_end: row.episode_end,
+        segment_type: row.segment_type,
+        segment_label: row.segment_label,
+        segment_reference_id: row.segment_reference_id,
+        duration: row.duration,
+        axis,
+        loaded: row.loaded,
+        frameCount: row.frame_count,
+        rawCount,
+        indexed,
+        expected,
+        missing,
+        density: { indexed: indexedDensity, expected: expectedDensity, raw: rawDensity },
+        delta: expected ? expected.count - indexed.count : null,
+      });
+    }
+
+    res.json({
+      anilistId,
+      gapThreshold,
+      buckets,
+      pruneMargin: config.pruneMargin,
+      expected: wantExpected,
+      files,
+      totals: {
+        files: files.length,
+        indexedVectors,
+        expectedVectors: wantExpected ? expectedVectors : null,
+        missingSeconds: wantExpected ? Math.round(missingSeconds * 1000) / 1000 : null,
+      },
+      ms: (performance.now() - startTime) | 0,
     });
   } catch (error) {
     console.error(error);

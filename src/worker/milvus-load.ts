@@ -6,6 +6,7 @@ import zlib from "node:zlib";
 import { MilvusClient } from "@zilliz/milvus2-sdk-node";
 
 import sql from "../../sql.ts";
+import { dedupeHashList } from "../lib/dedupe-hash-list.ts";
 
 const zstdDecompress = promisify(zlib.zstdDecompress);
 
@@ -23,37 +24,9 @@ const [row] = await sql`
     id = ${id}
 `;
 
-const hashList = JSON.parse((await zstdDecompress(row.color_layout)).toString()).sort(
-  (a, b) => a.time - b.time,
+const dedupedHashList = dedupeHashList(
+  JSON.parse((await zstdDecompress(row.color_layout)).toString()),
 );
-
-const dedupedHashList = [];
-for (let i = 0; i < hashList.length; i++) {
-  const currentFrame = hashList[i];
-  let isDuplicate = false;
-
-  // search last 50 deduplicated frames
-  const startIndex = Math.max(0, dedupedHashList.length - 50);
-  for (let j = dedupedHashList.length - 1; j >= startIndex; j--) {
-    const frame = dedupedHashList[j];
-    // which is within 2 sec in time
-    if (currentFrame.time - frame.time < 2) {
-      // skip frames with exact hash by comparing each value in vector
-      let exactMatch = true;
-      for (let k = 0; k < frame.vector.length; k++) {
-        if (frame.vector[k] !== currentFrame.vector[k]) {
-          exactMatch = false;
-          break;
-        }
-      }
-      if (exactMatch) {
-        isDuplicate = true;
-        break;
-      }
-    }
-  }
-  if (!isDuplicate) dedupedHashList.push(currentFrame);
-}
 
 const milvus = new MilvusClient({ address: MILVUS_ADDR, token: MILVUS_TOKEN });
 
