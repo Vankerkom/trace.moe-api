@@ -1,6 +1,7 @@
 import fs from "node:fs/promises";
 import type { ServerResponse } from "node:http";
 import path from "node:path";
+import { performance } from "node:perf_hooks";
 import { Worker } from "node:worker_threads";
 
 import aniep from "aniep";
@@ -24,6 +25,7 @@ export default class TaskManager {
     try {
       clearTimeout(this.scanTimer);
       console.info(`[scan][doing] ${VIDEO_PATH}`);
+      const startScan = performance.now();
 
       const [dbSet, fileList] = await Promise.all([
         sql`
@@ -47,6 +49,10 @@ export default class TaskManager {
       ]);
 
       const newFileList = fileList.filter((e) => !dbSet.has(e));
+      console.info(
+        `[scan] found ${fileList.length} files on disk, ${dbSet.size} already known, ` +
+          `${newFileList.length} new`,
+      );
 
       for (let i = 0; i < newFileList.length; i += 10000) {
         await sql`
@@ -65,7 +71,8 @@ export default class TaskManager {
         `;
       }
 
-      console.info(`[scan][done]  ${VIDEO_PATH}`);
+      const scanMs = (performance.now() - startScan) | 0;
+      console.info(`[scan][done]  ${VIDEO_PATH} added=${newFileList.length} in ${scanMs}ms`);
 
       this.runAnilistTask();
       this.runCrc32Task();

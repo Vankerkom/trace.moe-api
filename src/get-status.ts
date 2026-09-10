@@ -47,6 +47,8 @@ export default async (req, res) => {
         SUM(duration) AS sum_duration
       FROM
         files
+      WHERE
+        loaded = true
     `;
     mediaCount = Number(count);
     mediaDurationTotal = Number(sum_duration);
@@ -59,14 +61,14 @@ export default async (req, res) => {
   let memoryUsage = 0;
 
   try {
-    const collectionStatistics = await req.app.locals.milvus.getCollectionStatistics({
+    const counted = await req.app.locals.milvus.query({
       collection_name: "frame_color_layout",
+      filter: "",
+      output_fields: ["count(*)"],
     });
-    if (collectionStatistics?.data?.row_count) {
-      rowCount = Number(collectionStatistics.data.row_count);
-    }
+    rowCount = Number(counted.data?.[0]?.["count(*)"] ?? 0);
   } catch (err) {
-    console.error("[get-status] Failed to get Milvus collection statistics:", err);
+    console.error("[get-status] Failed to get Milvus row count:", err);
   }
 
   try {

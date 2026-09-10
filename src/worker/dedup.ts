@@ -41,6 +41,7 @@ try {
       id ASC
   `;
   groupCount = group.length;
+  console.info(`[dedup] anilist ${anilistId} ${group.length} loaded episodes`);
 
   const segments = await sql`
     SELECT
@@ -53,6 +54,10 @@ try {
       anilist_id = ${anilistId}
       AND segment_type IS NOT NULL
   `;
+  console.info(
+    `[dedup] anilist ${anilistId} ${segments.length} existing segments ` +
+      `(${segments.filter((e) => e.loaded).length} loaded)`,
+  );
 
   const [previous] = await sql`
     SELECT
@@ -67,12 +72,21 @@ try {
   // grew enough that the previous result is likely no longer the best one
   const grew = previous ? group.length >= previous.loaded_file_count * config.redetectRatio : true;
   const fullRun = force || segments.length === 0 || grew;
+  console.info(
+    `[dedup] anilist ${anilistId} fullRun=${fullRun} (force=${!!force} noSegments=${
+      segments.length === 0
+    } grew=${grew})`,
+  );
 
   const startDetect = performance.now();
 
   if (fullRun) {
+    console.info(`[dedup][doing] anilist ${anilistId} detecting candidates`);
     const candidates = await detectSeriesSegments(milvus, anilistId, group);
     detectMs = (performance.now() - startDetect) | 0;
+    console.info(
+      `[dedup][done]  anilist ${anilistId} detected ${candidates.length} candidates in ${detectMs}ms`,
+    );
 
     // a series can legitimately have several openings, so a candidate is only
     // redundant when the episodes it explains are already linked to a segment
@@ -92,16 +106,27 @@ try {
       if (set) set.add(row.file_id);
       else covered.set(row.segment_type, new Set([row.file_id]));
     }
+    console.info(
+      `[dedup] anilist ${anilistId} already covered: ` +
+        `${[...covered.entries()].map(([type, ids]) => `${type}=${ids.size}`).join(", ") || "none"}`,
+    );
 
     const startExtract = performance.now();
     for (const candidate of candidates) {
       const already = covered.get(candidate.type) ?? new Set();
       const fresh = candidate.matches.filter((e) => !already.has(e.file_id));
       if (fresh.length < config.minSupport) {
+        console.info(
+          `[dedup] anilist ${anilistId} ${candidate.type} skipped: already extracted ` +
+            `(fresh=${fresh.length} minSupport=${config.minSupport})`,
+        );
         log.push({ type: candidate.type, skipped: "already extracted" });
         continue;
       }
       if (config.milvusReadonly) {
+        console.info(
+          `[dedup] anilist ${anilistId} ${candidate.type} skipped: DEDUP_MILVUS_READONLY`,
+        );
         log.push({ type: candidate.type, skipped: "DEDUP_MILVUS_READONLY", ...summary(candidate) });
         continue;
       }
@@ -114,10 +139,21 @@ try {
       );
     }
     extractMs = (performance.now() - startExtract) | 0;
+    console.info(
+      `[dedup] anilist ${anilistId} extraction pass done: ${segmentsFound} segments in ${extractMs}ms`,
+    );
   } else {
     // incremental: align the episodes that are not linked to a segment yet
+    console.info(
+      `[dedup][doing] anilist ${anilistId} incremental alignment of ${segments.length} segments`,
+    );
     for (const segment of segments) {
-      if (!segment.loaded) continue;
+      if (!segment.loaded) {
+        console.info(
+          `[dedup] segment ${segment.id} (${segment.segment_type}) skipped: not loaded yet`,
+        );
+        continue;
+      }
       const linked = await sql`
         SELECT
           file_id
@@ -128,10 +164,23 @@ try {
       `;
       const linkedIds = new Set(linked.map((e) => e.file_id));
       const targets = group.filter((e) => !linkedIds.has(e.id));
-      if (targets.length === 0) continue;
+      if (targets.length === 0) {
+        console.info(
+          `[dedup] segment ${segment.id} (${segment.segment_type}) already linked to all episodes`,
+        );
+        continue;
+      }
 
+      console.info(
+        `[dedup] segment ${segment.id} (${segment.segment_type}) checking ${targets.length} unlinked episodes`,
+      );
       const matches = await matchSegmentToFiles(milvus, segment.id, targets);
-      if (matches.length === 0) continue;
+      if (matches.length === 0) {
+        console.info(
+          `[dedup] segment ${segment.id} (${segment.segment_type}) no new matches found`,
+        );
+        continue;
+      }
       await sql`
         INSERT INTO
           segment_matches ${sql(
@@ -146,18 +195,27 @@ try {
         ON CONFLICT (segment_file_id, file_id) DO NOTHING
       `;
       segmentsFound++;
+      console.info(
+        `[dedup] segment ${segment.id} (${segment.segment_type}) added ${matches.length} segment_matches`,
+      );
       log.push({ type: segment.segment_type, segmentFileId: segment.id, added: matches.length });
     }
     detectMs = (performance.now() - startDetect) | 0;
+    console.info(`[dedup][done]  anilist ${anilistId} incremental alignment in ${detectMs}ms`);
   }
 
   // prune every segment of this series whose synthetic file is now queryable,
   // including ones extracted by an earlier run that had not loaded yet
+  console.info(`[dedup] anilist ${anilistId} checking ${segments.length} segments for pruning`);
   for (const segment of segments) {
     const result = await pruneMatches(milvus, segment.id);
     if (result.pruned) log.push({ segmentFileId: segment.id, pruned: result.pruned });
   }
 
+  console.info(
+    `[dedup] anilist ${anilistId} computing dedup_runs row ` +
+      `(loaded=${group.length} segmentsFound=${segmentsFound} detectMs=${detectMs} extractMs=${extractMs})`,
+  );
   await sql`
     INSERT INTO
       dedup_runs ${sql({

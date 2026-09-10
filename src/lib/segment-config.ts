@@ -90,4 +90,4 @@ export const segmentPath = (
   type: string,
   segmentFileId: number,
   referenceFileId: number,
-) => `${config.segmentDir}/${anilistId}/${type}-${segmentFileId}-${referenceFileId}.mp4`;
+) => `${config.segmentDir}/${anilistId}/${type}-${segmentFileId}-${referenceFileId}.mkv`;

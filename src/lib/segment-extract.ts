@@ -1,6 +1,7 @@
 import child_process from "node:child_process";
 import fs from "node:fs/promises";
 import path from "node:path";
+import { performance } from "node:perf_hooks";
 
 import sql from "../../sql.ts";
 import { config, segmentPath } from "./segment-config.ts";
@@ -48,13 +49,15 @@ export const cutSegment = (
       "0:a:0?",
       ...(height > 720 ? ["-vf", "scale=-2:720"] : []),
       "-c:v",
-      "libx264",
+      "libx265",
       "-crf",
-      "20",
+      "19",
       "-preset",
-      "veryfast",
+      "slow",
+      "-x265-params",
+      "limit-sao:bframes=8:psy-rd=1:aq-mode=3",
       "-pix_fmt",
-      "yuv420p",
+      "yuv420p10le",
       "-c:a",
       "aac",
       "-ac",
@@ -67,8 +70,6 @@ export const cutSegment = (
       "-1",
       "-map_chapters",
       "-1",
-      "-movflags",
-      "+faststart",
       outputPath,
     ]);
     ffmpeg.stderr.on("data", (data) => console.log(data.toString()));
@@ -116,6 +117,11 @@ export const extractSegment = async (candidate: Candidate) => {
 
   try {
     await fs.mkdir(path.dirname(outputPath), { recursive: true });
+    console.info(
+      `[segment-extract][doing] ${reference.path} start=${candidate.start.toFixed(1)}s ` +
+        `duration=${candidate.duration.toFixed(1)}s -> ${relativePath}`,
+    );
+    const startExtract = performance.now();
     const code = await cutSegment(
       path.join(VIDEO_PATH, reference.path),
       outputPath,
@@ -123,7 +129,9 @@ export const extractSegment = async (candidate: Candidate) => {
       candidate.duration,
       videoHeight(reference.media_info),
     );
+    const extractMs = (performance.now() - startExtract) | 0;
     if (code !== 0) throw new Error(`ffmpeg exited with ${code}`);
+    console.info(`[segment-extract][done]  ${relativePath} in ${extractMs}ms`);
 
     await sql`
       INSERT INTO
@@ -191,10 +199,20 @@ export const pruneMatches = async (milvus: any, segmentFileId: number | null = n
     return { pruned: 0, skipped: pending.length };
   }
 
+  console.info(
+    `[prune][doing] segment ${segmentFileId ?? "*"} ${pending.length} pending range deletes`,
+  );
+  const startPrune = performance.now();
+  let pruned = 0;
+  let skipped = 0;
+
   for (const match of pending) {
     const start = match.start_time + config.pruneMargin;
     const end = match.end_time - config.pruneMargin;
-    if (end <= start) continue;
+    if (end <= start) {
+      skipped++;
+      continue;
+    }
     const result = await milvus.delete({
       collection_name: "frame_color_layout",
       filter: `file_id == ${match.file_id} and time >= ${start} and time <= ${end}`,
@@ -207,9 +225,15 @@ export const pruneMatches = async (milvus: any, segmentFileId: number | null = n
       WHERE
         id = ${match.id}
     `;
+    pruned++;
   }
 
-  return { pruned: pending.length, skipped: 0 };
+  const pruneMs = (performance.now() - startPrune) | 0;
+  console.info(
+    `[prune][done]  segment ${segmentFileId ?? "*"} pruned=${pruned} skipped=${skipped} in ${pruneMs}ms`,
+  );
+
+  return { pruned, skipped };
 };
 
 /**

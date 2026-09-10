@@ -1,23 +1,21 @@
 services:
+  www:
+    image: ghcr.io/soruly/trace.moe-www:latest
+    restart: unless-stopped
+    environment:
+      - NEXT_PUBLIC_API_ENDPOINT=http://localhost:3001
+    ports:
+      - "127.0.0.1:3000:3000"
+
   postgres:
-    image: postgres:18
+    image: postgres:18-alpine
     restart: unless-stopped
     ports:
-      - ${DB_PORT}:5432
+      - "127.0.0.1:5432:5432"
     environment:
-      POSTGRES_PASSWORD: ${DB_PASS}
+      POSTGRES_PASSWORD: postgres
     volumes:
       - postgres:/var/lib/postgresql
-    entrypoint:
-      - "bash"
-      - "-c"
-      - |
-        if [ ! -f /var/lib/postgresql/server.key ]; then
-          openssl req -new -x509 -days 3650 -nodes -out /var/lib/postgresql/server.crt -keyout /var/lib/postgresql/server.key -subj "/CN=postgres"
-          chown postgres:postgres /var/lib/postgresql/server.crt /var/lib/postgresql/server.key
-          chmod 600 /var/lib/postgresql/server.key
-        fi
-        exec docker-entrypoint.sh postgres -c ssl=on -c ssl_cert_file=/var/lib/postgresql/server.crt -c ssl_key_file=/var/lib/postgresql/server.key
 
   adminer:
     image: adminer:latest
@@ -25,7 +23,7 @@ services:
     environment:
       - ADMINER_DEFAULT_SERVER=postgres
     ports:
-      - 8080:8080
+      - "127.0.0.1:8080:8080"
 
   etcd:
     container_name: milvus-etcd
@@ -91,8 +89,20 @@ services:
       - "etcd"
       - "minio"
 
+  attu:
+    image: zilliz/attu:v3.0.0
+    ports:
+      - "127.0.0.1:3002:3000"
+    environment:
+      - MILVUS_ADDRESS=milvus:19530
+    volumes:
+      - attu-data:/data
+    depends_on:
+      - milvus
+
 volumes:
   postgres:
   etcd:
   minio:
   milvus:
+  attu-data:
