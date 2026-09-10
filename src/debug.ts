@@ -6,7 +6,7 @@ import { Worker } from "node:worker_threads";
 import zlib from "node:zlib";
 
 import sql from "../sql.ts";
-import { cachedBumpers, loadBumperPool, matchBumper } from "./lib/bumper-pool.ts";
+import { cachedBranding, discoverCandidates, loadBrandingPool } from "./lib/branding-pool.ts";
 import { dedupeHashList } from "./lib/dedupe-hash-list.ts";
 import {
   bucketDensity,
@@ -16,7 +16,12 @@ import {
   subtractBlocks,
 } from "./lib/milvus-times.ts";
 import { config, SEGMENT_TYPES } from "./lib/segment-config.ts";
-import { detectSeriesSegments, type GroupFile } from "./lib/segment-detect.ts";
+import {
+  detectSeriesSegments,
+  loadBrandingClaims,
+  matchSegmentToFiles,
+  type GroupFile,
+} from "./lib/segment-detect.ts";
 import { pruneMatches, revertSegment } from "./lib/segment-extract.ts";
 
 const zstdDecompress = promisify(zlib.zstdDecompress);
@@ -62,7 +67,15 @@ export const dedupDryRun = async (req, res) => {
     const types = req.query.types ? String(req.query.types).split(",") : undefined;
 
     const startTime = performance.now();
-    const candidates = await detectSeriesSegments(req.app.locals.milvus, anilistId, group, types);
+    // the real worker masks out branding, so a dry run has to as well
+    const claimed = await loadBrandingClaims(group.map((e) => e.id));
+    const candidates = await detectSeriesSegments(
+      req.app.locals.milvus,
+      anilistId,
+      group,
+      types,
+      claimed,
+    );
     const detectMs = (performance.now() - startTime) | 0;
 
     const pathById = new Map(group.map((e: any) => [e.id, e.path]));
@@ -266,10 +279,10 @@ export const pruneAll = async (req, res) => {
   }
 };
 
-/** GET /debug/bumpers - the still pool, its cached hashes, and what each matches. */
-export const listBumpers = async (req, res) => {
+/** GET /debug/branding - the image/video pool, its hashes, and what each matches. */
+export const listBranding = async (req, res) => {
   try {
-    const bumpers = await loadBumperPool();
+    const items = await loadBrandingPool();
     const segmentIds = new Set<number>(
       (
         await sql`
@@ -282,31 +295,77 @@ export const listBumpers = async (req, res) => {
         `
       ).map((e) => e.id),
     );
-    const withMatches = [];
-    for (const bumper of bumpers) {
-      const startTime = performance.now();
-      const matches =
-        "match" in req.query ? await matchBumper(req.app.locals.milvus, bumper, segmentIds) : null;
-      withMatches.push({
-        label: bumper.label,
-        file: bumper.file,
-        vector: bumper.vector,
-        detectMs: matches ? (performance.now() - startTime) | 0 : null,
+
+    const report = [];
+    for (const item of items) {
+      const [clip] = await sql`
+        SELECT
+          f.id,
+          f.path,
+          f.loaded,
+          f.duration,
+          f.color_layout IS NOT NULL AS hashed,
+          (
+            SELECT
+              count(*)
+            FROM
+              segment_matches m
+            WHERE
+              m.segment_file_id = f.id
+          ) AS match_count
+        FROM
+          files f
+        WHERE
+          f.segment_type = 'branding'
+          AND f.segment_label = ${item.label}
+      `;
+
+      let matches = null;
+      let detectMs = null;
+      if ("match" in req.query && clip?.hashed) {
+        const startTime = performance.now();
+        const candidateIds = (
+          await discoverCandidates(req.app.locals.milvus, item, segmentIds)
+        ).filter((id) => !segmentIds.has(id));
+        const targets = candidateIds.length
+          ? await sql`
+              SELECT
+                id,
+                duration
+              FROM
+                files
+              WHERE
+                id IN ${sql(candidateIds)}
+                AND loaded = TRUE
+            `
+          : [];
+        matches = await matchSegmentToFiles(req.app.locals.milvus, clip.id, targets);
+        detectMs = (performance.now() - startTime) | 0;
+      }
+
+      report.push({
+        label: item.label,
+        imageFile: item.imageFile,
+        videoFile: item.videoFile,
+        videoPath: item.videoPath,
+        vector: item.vector,
+        clip: clip ?? null,
+        detectMs,
         matchCount: matches?.length ?? null,
         matches: matches?.slice(0, 50) ?? null,
       });
     }
-    res.json({ path: config.bumperPath, cached: cachedBumpers().length, bumpers: withMatches });
+    res.json({ path: config.brandingPath, cached: cachedBranding().length, branding: report });
   } catch (error) {
     console.error(error);
     res.status(500).json({ error: String(error) });
   }
 };
 
-/** POST /debug/bumpers/apply - run the real bumper worker. */
-export const bumperApply = async (req, res) => {
+/** POST /debug/branding/apply - run the real branding worker. */
+export const brandingApply = async (req, res) => {
   try {
-    const code = await runWorker("./src/worker/bumper.ts", null);
+    const code = await runWorker("./src/worker/branding.ts", null);
     res.json({ exitCode: code, milvusReadonly: config.milvusReadonly });
   } catch (error) {
     console.error(error);

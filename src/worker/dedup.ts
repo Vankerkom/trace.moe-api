@@ -7,6 +7,7 @@ import sql from "../../sql.ts";
 import { config } from "../lib/segment-config.ts";
 import {
   detectSeriesSegments,
+  loadBrandingClaims,
   matchSegmentToFiles,
   type GroupFile,
 } from "../lib/segment-detect.ts";
@@ -81,8 +82,17 @@ try {
   const startDetect = performance.now();
 
   if (fullRun) {
+    const claimed = await loadBrandingClaims(group.map((e) => e.id));
+    console.info(`[dedup] anilist ${anilistId} ${claimed.size} episodes carry a branding bumper`);
+
     console.info(`[dedup][doing] anilist ${anilistId} detecting candidates`);
-    const candidates = await detectSeriesSegments(milvus, anilistId, group);
+    const candidates = await detectSeriesSegments(
+      milvus,
+      anilistId,
+      group,
+      ["opening", "ending"],
+      claimed,
+    );
     detectMs = (performance.now() - startDetect) | 0;
     console.info(
       `[dedup][done]  anilist ${anilistId} detected ${candidates.length} candidates in ${detectMs}ms`,

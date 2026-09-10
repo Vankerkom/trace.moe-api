@@ -124,8 +124,8 @@ if (process.env.DEBUG_ENDPOINTS) {
   app.all("/debug/segments/:segmentFileId/prune", debug.segmentPrune);
   app.all("/debug/segments/:segmentFileId/revert", debug.segmentRevert);
   app.all("/debug/prune", debug.pruneAll);
-  app.get("/debug/bumpers", debug.listBumpers);
-  app.all("/debug/bumpers/apply", debug.bumperApply);
+  app.get("/debug/branding", debug.listBranding);
+  app.all("/debug/branding/apply", debug.brandingApply);
   app.get("/debug/milvus/series/:anilistId", debug.milvusSeries);
   app.get("/debug/milvus/file/:fileId", debug.milvusFile);
 }

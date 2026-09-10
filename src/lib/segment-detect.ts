@@ -16,6 +16,9 @@ export interface SegmentMatch {
   start_time: number;
   end_time: number;
   score: number;
+  // where the segment's t=0 lands in the target, when it is known. start_time
+  // is only as precise as the probe spacing; this is not.
+  delta?: number;
 }
 
 export interface Candidate {
@@ -83,7 +86,22 @@ export const searchProbes = async (
   milvus: any,
   probes: Frame[],
   fileIds: number[] | null,
+  excludeFileIds: number[] | null = null,
 ): Promise<{ file_id: number; time: number; score: number }[][]> => {
+  // a global probe is capped at searchLimit hits, so callers that need to walk
+  // past that cap re-query while excluding what they already have
+  const clauses: string[] = [];
+  const exprValues: Record<string, number[]> = {};
+  if (fileIds) {
+    clauses.push("file_id IN {list}");
+    exprValues.list = fileIds;
+  }
+  if (excludeFileIds?.length) {
+    clauses.push("file_id NOT IN {exclude}");
+    exprValues.exclude = excludeFileIds;
+  }
+  const expr = clauses.length > 0 ? clauses.join(" and ") : null;
+
   const perProbe: { file_id: number; time: number; score: number }[][] = [];
   for (let i = 0; i < probes.length; i += config.probeChunkSize) {
     const chunk = probes.slice(i, i + config.probeChunkSize);
@@ -91,8 +109,8 @@ export const searchProbes = async (
       collection_name: "frame_color_layout",
       data: chunk.map((e) => e.vector),
       limit: config.searchLimit,
-      expr: fileIds ? "file_id IN {list}" : null,
-      exprValues: fileIds ? { list: fileIds } : null,
+      expr,
+      exprValues: expr ? exprValues : null,
       output_fields: ["file_id", "time"],
     });
     throwOnMilvusError(result, "search");
@@ -117,6 +135,33 @@ const addClaimed = (claimed: ClaimedRanges, candidate: Candidate) => {
     if (ranges) ranges.push([match.start_time, match.end_time]);
     else claimed.set(match.file_id, [[match.start_time, match.end_time]]);
   }
+};
+
+/**
+ * The ranges the branding stage already claimed in these files. Branding runs
+ * before opening/ending detection precisely so those ranges can be masked out
+ * here - a bumper at t=0 would otherwise be swallowed by the opening.
+ */
+export const loadBrandingClaims = async (fileIds: number[]): Promise<ClaimedRanges> => {
+  const claimed: ClaimedRanges = new Map();
+  if (fileIds.length === 0) return claimed;
+  for (const row of await sql`
+    SELECT
+      m.file_id,
+      m.start_time,
+      m.end_time
+    FROM
+      segment_matches m
+      JOIN files s ON s.id = m.segment_file_id
+    WHERE
+      s.segment_type = 'branding'
+      AND m.file_id IN ${sql(fileIds)}
+  `) {
+    const ranges = claimed.get(row.file_id);
+    if (ranges) ranges.push([row.start_time, row.end_time]);
+    else claimed.set(row.file_id, [[row.start_time, row.end_time]]);
+  }
+  return claimed;
 };
 
 /** Merge sorted timestamps into runs, tolerating gaps up to `gapTolerance`. */
@@ -359,20 +404,25 @@ export const matchSegmentToFiles = async (
       start_time: Math.max(0, start),
       end_time: targetDuration ? Math.min(targetDuration, end) : end,
       score: [...kept.values()].reduce((sum, e) => sum + e, 0) / kept.size,
+      delta,
     });
   }
   return matches;
 };
 
-/** Detect the openings/endings shared by the episodes of one anilist_id. */
+/**
+ * Detect the openings/endings shared by the episodes of one anilist_id.
+ * `claimed` seeds the mask with footage another pass already explained - the
+ * branding stage runs first, and its bumpers must not end up inside an opening.
+ */
 export const detectSeriesSegments = async (
   milvus: any,
   anilistId: number,
   group: GroupFile[],
   types: string[] = ["opening", "ending"],
+  claimed: ClaimedRanges = new Map(),
 ): Promise<Candidate[]> => {
   const accepted: Candidate[] = [];
-  const claimed: ClaimedRanges = new Map();
 
   for (const typeName of types) {
     const typeConfig = SEGMENT_TYPES[typeName];

@@ -44,7 +44,7 @@ export const SEGMENT_TYPES: Record<string, SegmentTypeConfig> = {
     minDuration: num(process.env.DEDUP_BRANDING_MIN, 4.5),
     maxDuration: num(process.env.DEDUP_BRANDING_MAX, 30),
     preferredDuration: null,
-    headWindow: num(process.env.DEDUP_BRANDING_SEARCH_WINDOW, 60),
+    headWindow: num(process.env.DEDUP_BRANDING_SEARCH_WINDOW, 15),
     tailWindow: null,
   },
 };
@@ -53,7 +53,7 @@ export const config = {
   enabled: bool(process.env.DEDUP_ENABLED, true),
   milvusReadonly: bool(process.env.DEDUP_MILVUS_READONLY, false),
 
-  bumperPath: process.env.BUMPER_PATH || path.join(VIDEO_PATH, "bumpers"),
+  brandingPath: process.env.BRANDING_PATH || path.join(VIDEO_PATH, "branding"),
   segmentDir: "segments",
 
   // how many episodes of a series are used as detection references
@@ -79,6 +79,10 @@ export const config = {
   // upper bound on detection rounds per type, including rounds that find
   // nothing and only advance past a run of atypical episodes
   maxDetectRounds: num(process.env.DEDUP_MAX_DETECT_ROUNDS, 12),
+
+  // a single global probe is capped at searchLimit hits, so branding discovery
+  // repeats the query while excluding what it already found
+  brandingDiscoveryRounds: num(process.env.DEDUP_BRANDING_DISCOVERY_ROUNDS, 10),
 
   // milvus probes sent per search call
   probeChunkSize: num(process.env.DEDUP_PROBE_CHUNK, 50),

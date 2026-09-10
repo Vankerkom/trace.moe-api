@@ -80,8 +80,9 @@ export default class TaskManager {
       this.runSceneChangesTask();
       this.runColorLayoutTask();
       this.runMilvusLoadTask();
+      // branding claims its ranges before the opening/ending pass looks at them
+      this.runBrandingTask();
       this.runDedupTask();
-      this.runBumperTask();
     } catch (error) {
       console.error(error);
     } finally {
@@ -253,10 +254,11 @@ export default class TaskManager {
   async runMilvusLoadTask() {
     if (this.milvusLoadTaskList.size >= this.milvusLoadTaskListMax) return;
     try {
-      for (const { id, path: relativePath } of await sql`
+      for (const { id, path: relativePath, segment_type: segmentType } of await sql`
         SELECT
           id,
-          path
+          path,
+          segment_type
         FROM
           files
         WHERE
@@ -264,11 +266,15 @@ export default class TaskManager {
           AND media_info IS NOT NULL
           AND scene_changes IS NOT NULL
           AND color_layout IS NOT NULL
-          AND anilist_id IN (
-            SELECT
-              id
-            FROM
-              anilist
+          AND (
+            anilist_id IN (
+              SELECT
+                id
+              FROM
+                anilist
+            )
+            -- a branding clip belongs to no single series, so it has no anilist_id
+            OR segment_type = 'branding'
           )
         ORDER BY
           id DESC
@@ -285,6 +291,8 @@ export default class TaskManager {
           this.milvusLoadTaskList.delete(id);
           this.publish();
           this.runMilvusLoadTask();
+          // a branding clip only becomes usable once it is queryable itself
+          if (segmentType === "branding") this.runBrandingTask();
           this.runDedupTask();
         });
         this.milvusLoadTaskList.set(id, { id, filePath, worker });
@@ -300,6 +308,9 @@ export default class TaskManager {
 
   async runDedupTask() {
     if (!config.enabled) return;
+    // branding ranges have to be recorded before opening/ending detection can
+    // mask them out, so never run the two stages at the same time
+    if (this.isBrandingTaskRunning) return;
     if (this.dedupTaskList.size >= this.dedupTaskListMax) return;
     try {
       // a series is due when it has never been analysed, or when the number of
@@ -372,26 +383,28 @@ export default class TaskManager {
     }
   }
 
-  isBumperTaskRunning = false;
+  isBrandingTaskRunning = false;
 
-  async runBumperTask() {
+  async runBrandingTask() {
     if (!config.enabled) return;
-    if (this.isBumperTaskRunning) return;
+    if (this.isBrandingTaskRunning) return;
     try {
-      this.isBumperTaskRunning = true;
-      const worker = new Worker("./src/worker/bumper.ts");
+      this.isBrandingTaskRunning = true;
+      const worker = new Worker("./src/worker/branding.ts");
       worker.on("error", (error) => console.error(error));
       worker.on("exit", () => {
-        this.isBumperTaskRunning = false;
+        this.isBrandingTaskRunning = false;
         this.publish();
+        // a newly registered clip is a new file and needs indexing itself
         this.runMediaInfoTask();
         this.runSceneChangesTask();
         this.runColorLayoutTask();
         this.runMilvusLoadTask();
+        this.runDedupTask();
       });
       this.publish();
     } catch (error) {
-      this.isBumperTaskRunning = false;
+      this.isBrandingTaskRunning = false;
       console.error(error);
     }
   }
@@ -458,7 +471,7 @@ export default class TaskManager {
       colorLayoutTaskList: Array.from(this.colorLayoutTaskList.values()).map((e) => e.filePath),
       milvusLoadTaskList: Array.from(this.milvusLoadTaskList.values()).map((e) => e.filePath),
       dedupTaskList: Array.from(this.dedupTaskList.values()).map((e) => e.filePath),
-      bumperTaskList: this.isBumperTaskRunning ? [config.bumperPath] : [],
+      brandingTaskList: this.isBrandingTaskRunning ? [config.brandingPath] : [],
     };
     for (const client of this.sseClients) {
       client.write(`data: ${JSON.stringify(tasks)}\n\n`);

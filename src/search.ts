@@ -352,6 +352,16 @@ export default async (req, res) => {
         files
       WHERE
         anilist_id = ${Number(req.query.anilistID)}
+      UNION
+      -- a segment holding this series' footage is in scope even when it is not
+      -- filed under it, which is the case for every cross-series branding clip
+      SELECT
+        m.segment_file_id AS id
+      FROM
+        segment_matches m
+        JOIN files f ON f.id = m.file_id
+      WHERE
+        f.anilist_id = ${Number(req.query.anilistID)}
     `;
 
     if (files.length === 0) {
@@ -507,7 +517,9 @@ export default async (req, res) => {
     for (const entry of rawResults) {
       const matches = matchesBySegment.get(entry.file_id);
       if (!matches) {
-        expanded.push(entry);
+        // a segment file with no episodes behind it has nothing to report - the
+        // canonical clip itself is not a result anyone asked for
+        if (!filesMap.get(entry.file_id)?.segment_type) expanded.push(entry);
         continue;
       }
       for (const match of matches) {

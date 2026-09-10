@@ -56,13 +56,13 @@ Express app wiring: CORS, rate limiting (100 req/min global; 60 req/hr for `/use
 2. **anilist** (`worker/anilist.ts`) — fetches AniList metadata for referenced anilist_ids not yet in the `anilist` table.
 3. **crc32** (`worker/crc32.ts`), **media-info** (`worker/media-info.ts`), **scene-changes** (`worker/scene-changes.ts`), **color-layout** (`worker/color-layout.ts`) — run independently/in parallel per file, populate the corresponding `files` columns.
 4. **milvus-load** (`worker/milvus-load.ts`) — once media_info, scene_changes, color_layout are all populated and the file's anilist_id exists in `anilist`, loads the file's per-scene color-layout vectors into the Milvus `frame_color_layout` collection and marks `files.loaded`. It deletes any existing vectors for the file first, so re-loading is idempotent.
-5. **dedup** (`worker/dedup.ts`) and **bumper** (`worker/bumper.ts`) — segment deduplication, see below. Both are skipped entirely when `DEDUP_ENABLED=0`.
+5. **branding** (`worker/branding.ts`) and **dedup** (`worker/dedup.ts`) — segment deduplication, see below. Branding always runs first, so the opening/ending pass can mask out the ranges it claimed. Both are skipped entirely when `DEDUP_ENABLED=0`.
 
 Task status is broadcast over SSE (`TaskManager.publish`/`subscribe`) to the `/tasks` endpoint (`src/tasks.ts` + `src/tasks.html`).
 
 The Color Layout Descriptor (MPEG-7-style, 8×8 grid + 2D-DCT) is deliberately implemented in pure JS rather than native code — see README.md's "Notes on Color Layout Computation" for the rationale (video decode via ffmpeg subprocess dominates cost; JS keeps it portable/browser-compatible). Hardware video decoding is intentionally not used either (see README's decode benchmarks) — CPU software decode outperforms GPU decode for this workload.
 
-### Segment deduplication (`src/lib/segment-*.ts`, `src/lib/bumper-pool.ts`)
+### Segment deduplication (`src/lib/segment-*.ts`, `src/lib/branding-pool.ts`)
 
 Openings and endings are near-identical across every episode of a series, so indexing them per episode wastes most of the Milvus index. The **dedup** stage groups a series by `anilist_id`, samples probe frames from a reference episode's `files.color_layout` into the head/tail window, searches them against Milvus scoped to that series, and histograms `targetTime - referenceTime`: a repeated segment appears as a run of probes sharing one time offset per episode (a diagonal in the match matrix), which tolerates dark frames and per-episode edits.
 
@@ -75,7 +75,7 @@ Details that are easy to get wrong, all learned from real failures:
 - `extractSegment` reserves the row id from `files_id_seq` and only inserts the row after ffmpeg finishes, otherwise the indexing stages pick up a path that is still being written.
 - `revertSegment` rebuilds whole files, which restores ranges other segments had pruned, so it re-queues those matches.
 
-`src/search.ts` expands a hit on a segment file into one result per source episode, with timestamps remapped into the real episode, before the top-10 slice — so an opening search returns every episode it appears in and the preview URLs stream from the original files. Branding bumpers work from still images placed in `BUMPER_PATH` (default `$VIDEO_PATH/bumpers`), hashed in memory and used as Milvus queries.
+`src/search.ts` expands a hit on a segment file into one result per source episode, with timestamps remapped into the real episode, before the top-10 slice — so an opening search returns every episode it appears in and the preview URLs stream from the original files. Branding bumpers come from `BRANDING_PATH` (default `$VIDEO_PATH/branding`) as a pair per bumper: `<name>.png` is hashed in memory and used as a single Milvus query to discover which episodes contain it at all (paginated past `DEDUP_SEARCH_LIMIT` by re-querying with what it already found excluded), and `<name>.mp4`/`.mkv` is registered in place as an ordinary `files` row with `segment_type='branding'` and a NULL `anilist_id` — nothing is cut with ffmpeg. Once the clip is indexed, `matchSegmentToFiles` aligns its own frames against the discovered episodes to fix the exact per-episode range. `revertSegment` will not delete a file outside `segments/`, so reverting a bumper leaves the user's clip on disk.
 
 `DEDUP_MILVUS_READONLY=1` detects and records without writing to Milvus. `/debug/*` routes (mounted only when `DEBUG_ENDPOINTS` is set, unauthenticated) drive dry runs, applies, prunes and reverts.
 

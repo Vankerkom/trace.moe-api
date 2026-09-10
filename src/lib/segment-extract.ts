@@ -305,7 +305,11 @@ export const revertSegment = async (milvus: any, segmentFileId: number) => {
     WHERE
       id = ${segmentFileId}
   `;
-  await fs.rm(path.join(VIDEO_PATH, segment.path), { force: true }).catch(() => {});
+  // only files this stage created are ours to delete - a branding clip is
+  // indexed in place from the user's own directory and has to survive a revert
+  if (segment.path.split("/")[0] === config.segmentDir) {
+    await fs.rm(path.join(VIDEO_PATH, segment.path), { force: true }).catch(() => {});
+  }
 
   return { segmentFileId, restored: restoredIds };
 };
