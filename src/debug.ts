@@ -170,7 +170,23 @@ export const listSegments = async (req, res) => {
       WHERE
         f.segment_type IS NOT NULL ${anilistId === null
           ? sql``
-          : sql`AND f.anilist_id = ${anilistId}`}
+          : sql`
+              AND (
+                f.anilist_id = ${anilistId}
+                -- a branding clip has no anilist_id of its own; it shows up on a
+                -- series' timeline through the episodes it was matched against
+                OR EXISTS (
+                  SELECT
+                    1
+                  FROM
+                    segment_matches m2
+                    JOIN files ep ON ep.id = m2.file_id
+                  WHERE
+                    m2.segment_file_id = f.id
+                    AND ep.anilist_id = ${anilistId}
+                )
+              )
+            `}
       GROUP BY
         f.id
       ORDER BY
